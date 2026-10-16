@@ -1617,14 +1617,20 @@ SORTS = ("Name", "Typ", "Neueste zuerst")
 BOX_DEFAULTS = {"tint": "Glas", "opacity": "Normal", "icons": "Mittel", "sort": "Name",
                 "collapsed": False}
 SETTINGS_DEFAULTS = {"autosort": True, "quickhide": True, "attach": True,
-                     "hover_expand": True, "snap": True, "autostart": True}
+                     "hover_expand": True, "snap": True, "autostart": True,
+                     "context_menu": True, "remind_downloads": True}
 SETTING_LABELS = {
     "autosort": "Neue Verknüpfungen automatisch einsortieren",
     "quickhide": "Doppelklick auf den Desktop blendet Boxen aus",
     "hover_expand": "Eingeklappte Boxen beim Überfahren öffnen",
     "snap": "Boxen magnetisch ausrichten",
     "attach": "An den Desktop heften (bleibt bei Win + D)",
+    "context_menu": "Im Explorer-Rechtsklick „Mit Desktop Sorter aufräumen“",
+    "remind_downloads": "Wöchentlich an volle Downloads erinnern",
 }
+WINDOWS_ONLY_SETTINGS = {"attach", "context_menu"}
+REMIND_EVERY_DAYS = 7
+REMIND_MIN_FILES = 20           # so viele Dateien älter als 30 Tage lösen die Erinnerung aus
 PORTAL_LIMIT = 400              # mehr Einträge zeigt eine Ordner-Box nicht an
 
 
@@ -1845,6 +1851,28 @@ def set_autostart(on: bool) -> None:
           f"$s.WorkingDirectory='{q(script.parent)}';$s.Save()")
     subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
                    capture_output=True, timeout=30, creationflags=NO_WINDOW)
+
+
+def sync_context_menu(on: bool) -> None:
+    """Explorer-Rechtsklick „Mit Desktop Sorter aufräumen“ (pro Benutzer, ohne Admin)
+    eintragen bzw. entfernen – im Hintergrund, zeigt immer auf die aktuelle .pyw."""
+    if not Win32.ok:
+        return
+
+    def work():
+        try:
+            if on:
+                exe = Path(sys.executable)
+                if exe.with_name("pythonw.exe").exists():
+                    exe = exe.with_name("pythonw.exe")
+                org_context_menu_install(str(exe), str(Path(__file__).resolve()))
+            else:
+                org_context_menu_uninstall()
+        except Exception:                               # noqa: BLE001 — optionales Extra
+            pass
+
+    import threading
+    threading.Thread(target=work, daemon=True).start()
 
 
 # ---------- Programmsymbole ----------
@@ -2529,6 +2557,8 @@ class FenceManager(QObject):
         self.write_cfg()
         if key == "autostart":
             set_autostart(value)
+        elif key == "context_menu":
+            sync_context_menu(value)
         elif key == "quickhide":
             self.hook.start() if value else self.hook.stop()
         elif key == "attach":
@@ -2737,6 +2767,7 @@ class FenceManager(QObject):
             for path, cat in pairs:
                 if Path(path).exists():
                     self.move_to([path], cat, quiet=True)
+                    self._message_action = None
                     self.notify.emit("Automatisch einsortiert",
                                      f"{display_name(Path(path))} → {cat}")
 
@@ -2933,6 +2964,14 @@ class FenceManager(QObject):
         menu.addAction("+  Neue Ordner-Box …", self.new_portal)
         menu.addAction("▦  Boxen neu anordnen", self.arrange_all)
         menu.addAction("🧹  Downloads aufräumen …", lambda: self.open_cleaner(downloads_dir()))
+        org = glass_menu(menu, "📁  Ordner-Assistent")
+        for label, key in (("Dokumente", "documents"), ("Downloads", "downloads"),
+                           ("Bilder", "pictures"), ("Desktop", "desktop"),
+                           ("Videos", "videos")):
+            org.addAction(label, lambda k=key: self.open_organizer(org_known_folder(k)))
+        org.addSeparator()
+        org.addAction("Anderer Ordner …", self.pick_and_organize)
+        menu.addMenu(org)
 
         layouts = glass_menu(menu, "Layouts")
         layouts.aboutToShow.connect(lambda: self._fill_layouts(layouts))
@@ -2940,7 +2979,7 @@ class FenceManager(QObject):
 
         prefs = glass_menu(menu, "Einstellungen")
         for key, label in SETTING_LABELS.items():
-            if key == "attach" and not Win32.ok:
+            if key in WINDOWS_ONLY_SETTINGS and not Win32.ok:
                 continue
             act = prefs.addAction(label)
             act.setCheckable(True)
@@ -2964,6 +3003,64 @@ class FenceManager(QObject):
         win.show()
         win.raise_()
         win.activateWindow()
+
+    def open_organizer(self, folder: Path):
+        """Ordner-Assistent für einen Ordner (ein Fenster je Ordner)."""
+        folder = Path(folder)
+        wins = [w for w in getattr(self, "_organizers", []) if w.isVisible()]
+        for w in wins:
+            if os.path.normcase(str(w.folder)) == os.path.normcase(str(folder)):
+                break
+        else:
+            w = OrganizerWindow(self, folder)
+            wins.append(w)
+        self._organizers = wins
+        w.show()
+        w.showNormal()
+        w.raise_()
+        w.activateWindow()
+
+    def pick_and_organize(self):
+        from PySide6.QtWidgets import QFileDialog
+        d = QFileDialog.getExistingDirectory(None, "Ordner aufräumen & sortieren",
+                                             str(org_known_folder("documents")))
+        if d:
+            self.open_organizer(Path(d))
+
+    # ----- Erinnerung: Downloads läuft voll -----
+    def check_downloads_reminder(self):
+        if not self.settings.get("remind_downloads"):
+            return
+        last = self.cfg.get("last_reminder", 0)
+        if time.time() - last < REMIND_EVERY_DAYS * 86400:
+            return
+        folder = downloads_dir()
+        cutoff = time.time() - 30 * 86400
+        old, size = 0, 0
+        try:
+            for p in folder.iterdir():
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                if st.st_mtime < cutoff and not p.name.lower() == "desktop.ini":
+                    old += 1
+                    size += st.st_size if p.is_file() else 0
+        except OSError:
+            return
+        if old >= REMIND_MIN_FILES:
+            self.cfg["last_reminder"] = time.time()
+            self.write_cfg()
+            self._message_action = lambda: self.open_cleaner(folder)
+            self.notify.emit("Downloads aufräumen?",
+                             f"{old} Dateien sind älter als 30 Tage ({human_size(size)}). "
+                             f"Klicken zum Durchwischen.")
+
+    def message_clicked(self):
+        action = getattr(self, "_message_action", None)
+        self._message_action = None
+        if action:
+            action()
 
     def _fill_layouts(self, menu: QMenu):
         menu.clear()
@@ -3100,6 +3197,7 @@ class SwipeCard(QWidget):
         self._press: QPoint | None = None
         self._anim = None
         self.done_text = ""
+        self.confirm = None             # optional: fn(action, entry) -> bool
         self.setCursor(Qt.OpenHandCursor)
         icon_cache().updated.connect(lambda _: self.update())
 
@@ -3151,6 +3249,9 @@ class SwipeCard(QWidget):
 
     def fly(self, action: str):
         if not self.entry or self._busy():
+            return
+        if self.confirm and not self.confirm(action, self.entry):   # z. B. „wirklich löschen?“
+            self._animate(0.0, 180)
             return
         target = (-1.0 if action == "trash" else 1.0) * (self.width() + self.CW)
         self._animate(target, 230, lambda: self.decided.emit(action))
@@ -3260,6 +3361,40 @@ class SwipeCard(QWidget):
         p.drawText(QRectF(r.left() + 22, y + 52, r.width() - 44, 80),
                    Qt.AlignLeft | Qt.AlignTop, "\n".join(lines))
 
+        chip = org_chip(e.get("org"))           # Vorsortierung: Vorschlag + Grund
+        if chip:
+            text, color = chip
+            f.setPixelSize(12)
+            f.setWeight(QFont.DemiBold)
+            p.setFont(f)
+            fm = p.fontMetrics()
+            text = fm.elidedText(text, Qt.ElideRight, int(r.width() - 72))
+            cr = QRectF(r.left() + 22, r.bottom() - 46, fm.horizontalAdvance(text) + 26, 28)
+            bg = QColor(color)
+            bg.setAlpha(60)
+            path = QPainterPath()
+            path.addRoundedRect(cr, 14, 14)
+            p.fillPath(path, bg)
+            p.setPen(QPen(QColor(color), 1.2))
+            p.drawPath(path)
+            p.setPen(QColor(color).lighter(150))
+            p.drawText(cr, Qt.AlignCenter, text)
+
+
+def org_chip(f) -> tuple[str, str] | None:
+    """Text + Farbe des Vorsortier-Chips einer Karte (None = keine Analyse)."""
+    if f is None:
+        return None
+    label = ORG_CATEGORIES.get(f.category, {}).get("label", "")
+    reason = f.reasons[0] if f.reasons else label
+    if f.tier == ORG_JUNK:
+        return f"Vorschlag: Papierkorb – {reason}", "#FF453A"
+    if f.tier == ORG_PROTECT:
+        return f"🔒 Wichtig – {label or reason}", "#30D158"
+    if f.tier == ORG_KEEP:
+        return f"Behalten – {label or reason}", "#64D2FF"
+    return (f"{label}: {reason}" if label and reason != label else (reason or "Prüfen")), "#FFD60A"
+
 
 class RoundButton(QAbstractButton):
     def __init__(self, glyph: str, color: str, size=64, tip="", parent=None):
@@ -3290,17 +3425,27 @@ class RoundButton(QAbstractButton):
         p.drawText(self.rect(), Qt.AlignCenter, self.glyph)
 
 
-class CleanerWindow(_Base):
-    """Downloads (oder jeden anderen Ordner) Datei für Datei aufräumen."""
+CLEANER_SORTS = ("Vorsortiert", "Älteste zuerst", "Größte zuerst")
+ORG_TIER_ORDER = {ORG_JUNK: 0, ORG_REVIEW: 1, ORG_KEEP: 2, ORG_PROTECT: 3}
 
-    def __init__(self, mgr: "FenceManager", folder: Path):
+
+class CleanerWindow(_Base):
+    """Downloads (oder jeden anderen Ordner bzw. eine übergebene Dateiliste) Datei für
+    Datei aufräumen. „Vorsortiert“: Müll-Vorschläge zuerst, Wichtiges zuletzt."""
+
+    def __init__(self, mgr: "FenceManager", folder: Path, entries: list | None = None,
+                 title: str | None = None, hints=None):
         super().__init__()
-        self.mgr, self.folder = mgr, folder
+        self.mgr, self.folder = mgr, Path(folder)
+        self.fixed = [Path(p) for p in entries] if entries is not None else None
+        self.hints = hints                  # vorhandener OrgPlan (aus dem Ordner-Assistenten)
+        self.title_text = title or "Aufräumen"
         self.decisions: list[tuple[dict, str]] = []     # (Eintrag, "trash"|"keep")
         self.queue: list[dict] = []
         self.idx = 0
         self.committed = False
-        self.setWindowTitle("Downloads aufräumen")
+        self._presort: OrgWorker | None = None
+        self.setWindowTitle(self.title_text)
         self.setWindowIcon(app_icon())
         if FRAMELESS:
             self.setTitleBar(TitleBar(self))
@@ -3319,7 +3464,7 @@ class CleanerWindow(_Base):
         head = QHBoxLayout()
         titles = QVBoxLayout()
         titles.setSpacing(2)
-        title = QLabel("Aufräumen")
+        title = QLabel(self.title_text)
         title.setObjectName("h1")
         self.sub = QLabel("")
         self.sub.setObjectName("sub")
@@ -3329,18 +3474,32 @@ class CleanerWindow(_Base):
         head.addStretch(1)
         self.b_folder = GlassButton("Ordner …", small=True)
         self.b_folder.clicked.connect(self.choose_folder)
-        self.b_sort = GlassButton("Älteste zuerst", small=True)
+        self.b_folder.setVisible(self.fixed is None)
+        self.b_sort = GlassButton(CLEANER_SORTS[0], small=True)
+        self.b_sort.setToolTip("Sortierung wechseln: Vorsortiert (Müll-Vorschläge zuerst) · "
+                               "Älteste zuerst · Größte zuerst")
         self.b_sort.clicked.connect(self.toggle_sort)
         head.addWidget(self.b_folder)
         head.addWidget(self.b_sort)
         root.addLayout(head)
 
+        opts = QHBoxLayout()
         self.t_again = Toggle("Behaltene erneut zeigen")
         self.t_again.toggled.connect(lambda _: self.load())
-        root.addWidget(self.t_again)
+        self.t_again.setVisible(self.fixed is None)
+        opts.addWidget(self.t_again)
+        opts.addStretch(1)
+        self.b_bulk = GlassButton("", small=True)
+        self.b_bulk.setToolTip("Alle Karten mit rotem „Vorschlag: Papierkorb“ auf einmal "
+                               "markieren (einzeln rückgängig machbar)")
+        self.b_bulk.clicked.connect(self.trash_all_suggestions)
+        self.b_bulk.hide()
+        opts.addWidget(self.b_bulk)
+        root.addLayout(opts)
 
         self.card = SwipeCard()
         self.card.decided.connect(self.decide)
+        self.card.confirm = self._confirm_action
         root.addWidget(self.card, 1)
 
         row = QHBoxLayout()
@@ -3371,42 +3530,124 @@ class CleanerWindow(_Base):
     def _kept(self) -> dict:
         return self.mgr.cfg.setdefault("cleaner_keep", {}).setdefault(str(self.folder), {})
 
-    def load(self):
-        kept = {} if self.t_again.isChecked() else self._kept()
-        entries = []
+    def _kept_key(self, p: Path) -> str:
         try:
-            children = list(self.folder.iterdir())
-        except OSError:
-            children = []
+            return p.relative_to(self.folder).as_posix()
+        except ValueError:
+            return str(p)
+
+    def load(self):
+        kept = {} if (self.t_again.isChecked() or self.fixed is not None) else self._kept()
+        protected = set(self.mgr.cfg.get("protected", []))
+        if self.fixed is not None:
+            children = [p for p in self.fixed if p.exists()]
+        else:
+            try:
+                children = list(self.folder.iterdir())
+            except OSError:
+                children = []
+        entries = []
         for p in children:
             if p.name.lower() == "desktop.ini" or is_hidden(p) or p.name.endswith(".crdownload"):
+                continue
+            if str(p) in protected:                  # vom Nutzer geschützt → nie anbieten
                 continue
             try:
                 mtime = p.stat().st_mtime
             except OSError:
                 continue
-            if kept.get(p.name) == int(mtime):
+            if kept.get(self._kept_key(p)) == int(mtime):
                 continue
             entries.append({"path": p, "mtime": mtime, "size": None, "origin": None})
         self.queue = self._sorted(entries)
         self.idx = 0
         self.show_current()
+        self._start_presort()
+
+    # ----- Vorsortierung durch die Analyse des Ordner-Assistenten -----
+    def _start_presort(self):
+        if self.hints is not None:                   # Plan liegt schon vor
+            return self._apply_hints(self.hints)
+        if self._presort and self._presort.isRunning():
+            return
+        folder, protected = self.folder, set(self.mgr.cfg.get("protected", []))
+
+        def job(progress, cancelled):
+            return org_analyze(folder, recursive=False, programs=org_installed_programs(),
+                               progress=progress, cancelled=cancelled,
+                               protected_paths=protected)
+
+        self.sub.setText(self.sub.text() + "  ·  analysiere …")
+        self._presort = OrgWorker(job, self)
+        self._presort.done.connect(self._apply_hints)
+        self._presort.failed.connect(lambda _msg: self.show_current())
+        self._presort.start()
+
+    def _apply_hints(self, plan):
+        by_path = {os.path.normcase(str(f.path)): f for f in plan.files}
+        for e in self.queue:
+            e["org"] = by_path.get(os.path.normcase(str(e["path"])))
+        if self.b_sort.text() == CLEANER_SORTS[0]:
+            self.queue = self.queue[:self.idx] + self._sorted(self.queue[self.idx:])
+        self.show_current()
 
     def _sorted(self, entries: list[dict]) -> list[dict]:
-        if self.b_sort.text() == "Größte zuerst":
+        mode = self.b_sort.text()
+        if mode == "Größte zuerst":
             for e in entries:
                 if e["size"] is None:
                     e["size"] = path_size(e["path"])
             return sorted(entries, key=lambda e: -e["size"])
+        if mode == CLEANER_SORTS[0] and any(e.get("org") for e in entries):
+            def key(e):
+                f = e.get("org")
+                tier = ORG_TIER_ORDER.get(f.tier, 1) if f else 1
+                return (tier, 0 if (f and f.dup_of) else 1, -(f.size if f else 0), e["mtime"])
+            return sorted(entries, key=key)
         return sorted(entries, key=lambda e: e["mtime"])
 
     def toggle_sort(self):
-        self.b_sort.setText("Größte zuerst" if self.b_sort.text() == "Älteste zuerst"
-                            else "Älteste zuerst")
+        i = CLEANER_SORTS.index(self.b_sort.text()) if self.b_sort.text() in CLEANER_SORTS else 0
+        self.b_sort.setText(CLEANER_SORTS[(i + 1) % len(CLEANER_SORTS)])
         self.b_sort.updateGeometry()
         # Bereits Entschiedenes bleibt, nur der Rest wird neu sortiert
         self.queue = self.queue[:self.idx] + self._sorted(self.queue[self.idx:])
         self.show_current()
+
+    def _suggested_junk(self) -> list[dict]:
+        return [e for e in self.queue[self.idx:] if e.get("org") and e["org"].tier == ORG_JUNK]
+
+    def trash_all_suggestions(self):
+        junk = self._suggested_junk()
+        if not junk or self.card._busy():
+            return
+        size = sum((e["org"].size if e.get("org") else 0) for e in junk)
+        if QMessageBox.question(self, "Vorschläge übernehmen",
+                                f"Alle {len(junk)} Löschvorschläge ({human_size(size)}) für den "
+                                f"Papierkorb markieren?\n\nGelöscht wird erst bei „Fertig“; "
+                                f"jede Markierung lässt sich mit ↶ zurücknehmen.") != QMessageBox.Yes:
+            return
+        ids = {id(e) for e in junk}
+        rest = [e for e in self.queue[self.idx:] if id(e) not in ids]
+        self.queue = self.queue[:self.idx] + junk + rest     # Vorschläge nach vorn …
+        for _ in junk:                                       # … und der Reihe nach markieren
+            cur = self.current()
+            if cur["size"] is None:
+                cur["size"] = cur["org"].size
+            self.decisions.append((cur, "trash"))
+            self.idx += 1
+        self.show_current()
+
+    def _confirm_action(self, action: str, entry: dict) -> bool:
+        """Sicherheitsabfrage, bevor etwas Wichtiges in den Papierkorb soll."""
+        f = entry.get("org")
+        if action != "trash" or f is None or f.tier != ORG_PROTECT or f.dup_of:
+            return True
+        label = ORG_CATEGORIES.get(f.category, {}).get("label", "wichtig")
+        return QMessageBox.question(
+            self, "Wirklich löschen?",
+            f"„{entry['path'].name}“ sieht wichtig aus ({label}).\n\n"
+            f"Trotzdem in den Papierkorb?") == QMessageBox.Yes
 
     def _prepare(self, e: dict | None):
         if e and "preview" not in e:
@@ -3437,6 +3678,11 @@ class CleanerWindow(_Base):
         for b in (self.b_trash, self.b_keep, self.b_open):
             b.setEnabled(cur is not None)
         self.b_undo.setEnabled(bool(self.decisions))
+        junk = self._suggested_junk()
+        self.b_bulk.setVisible(bool(junk))
+        if junk:
+            self.b_bulk.setText(f"🗑  Alle {len(junk)} Vorschläge → Papierkorb")
+            self.b_bulk.updateGeometry()
         self.b_done.setText(f"Fertig – {len(trash)} in den Papierkorb" if trash else "Fertig")
         self.b_done.updateGeometry()
 
@@ -3446,8 +3692,8 @@ class CleanerWindow(_Base):
         if not cur:
             return
         self.decisions.append((cur, action))
-        if action == "keep":
-            self._kept()[cur["path"].name] = int(cur["mtime"])
+        if action == "keep" and self.fixed is None:
+            self._kept()[self._kept_key(cur["path"])] = int(cur["mtime"])
             self.mgr.write_cfg()
         self.idx += 1
         self.show_current()
@@ -3456,8 +3702,8 @@ class CleanerWindow(_Base):
         if not self.decisions or self.card._busy():
             return
         entry, action = self.decisions.pop()
-        if action == "keep":
-            self._kept().pop(entry["path"].name, None)
+        if action == "keep" and self.fixed is None:
+            self._kept().pop(self._kept_key(entry["path"]), None)
             self.mgr.write_cfg()
         self.idx = max(0, self.idx - 1)
         self.queue[self.idx] = entry
@@ -3507,6 +3753,9 @@ class CleanerWindow(_Base):
         return failed
 
     def closeEvent(self, e):
+        if self._presort and self._presort.isRunning():
+            self._presort.cancel()
+            self._presort.wait(5000)
         n = sum(1 for _, a in self.decisions if a == "trash")
         failed = self.commit()
         if failed:
@@ -3537,6 +3786,16 @@ QListWidget { outline: none; }
 QListWidget::item { color: white; border-radius: 12px; padding: 4px; }
 QListWidget::item:hover { background: rgba(255,255,255,24); }
 QListWidget::item:selected { background: rgba(255,255,255,46); }
+QTreeWidget#org { background: transparent; border: none; outline: none; }
+QTreeWidget#org::item { padding: 4px 2px; border-radius: 6px; }
+QTreeWidget#org::item:hover { background: rgba(255,255,255,20); }
+QTreeWidget#org::item:selected { background: rgba(10,132,255,110); }
+QTreeWidget#org::indicator { width: 15px; height: 15px; border-radius: 4px;
+    border: 1px solid rgba(255,255,255,130); background: rgba(255,255,255,18); }
+QTreeWidget#org::indicator:checked { background: #0A84FF; border-color: #64D2FF; }
+QTreeWidget#org::indicator:indeterminate { background: rgba(10,132,255,110); border-color: #64D2FF; }
+QHeaderView::section { background: transparent; color: rgba(255,255,255,150); border: none;
+    border-bottom: 1px solid rgba(255,255,255,40); padding: 4px 6px; font-weight: 600; }
 QListWidget#fence::item { padding: 2px 1px; border-radius: 10px; }
 QListWidget#fence::item:selected { background: transparent; }
 QListWidget#fence::item:hover { background: rgba(255,255,255,30); }
@@ -3568,8 +3827,12 @@ def main():
                     help="Ordner mit dem Inhalt der Glas-Boxen")
     ap.add_argument("--background", action="store_true",
                     help="nur Boxen + Infobereich-Symbol (für den Autostart)")
+    ap.add_argument("--organize", nargs="?", default=None, metavar="ORDNER",
+                    help="Ordner-Assistent für diesen Ordner öffnen (Explorer-Rechtsklick)")
     ap.add_argument("--screenshot", type=Path, help=argparse.SUPPRESS)
-    args = ap.parse_args()
+    # parse_known_args: Explorer übergibt Pfade mit Eigenheiten (z. B. „C:\"“)
+    args, _unknown = ap.parse_known_args()
+    args.organize_folder = org_parse_cli_folder(sys.argv) if "--organize" in sys.argv else None
     if args.rules == DEFAULT_RULES and not DEFAULT_RULES.exists():
         try:
             DEFAULT_RULES.write_text(DEFAULT_RULES_TEXT, encoding="utf-8")
@@ -3616,8 +3879,12 @@ def run_app(app: QApplication, args) -> None:
     sock = QLocalSocket()
     sock.connectToServer(server_name)
     if sock.waitForConnected(300):
-        sock.write(b"background" if args.background else b"show")
-        sock.waitForBytesWritten(300)
+        if args.organize_folder:            # Explorer-Rechtsklick → laufende Instanz
+            msg = b"organize:" + str(args.organize_folder).encode("utf-8")
+        else:
+            msg = b"background" if args.background else b"show"
+        sock.write(msg)
+        sock.waitForBytesWritten(1000)
         return
     QLocalServer.removeServer(server_name)
     server = QLocalServer()
@@ -3635,6 +3902,13 @@ def run_app(app: QApplication, args) -> None:
     if Win32.ok and fences.settings["autostart"]:
         import threading
         threading.Thread(target=set_autostart, args=(True,), daemon=True).start()
+    if fences.settings["context_menu"]:
+        sync_context_menu(True)             # Rechtsklick-Eintrag aktuell halten
+    # Erinnerung an volle Downloads: 10 min nach dem Start, danach alle 6 h prüfen
+    QTimer.singleShot(10 * 60 * 1000, fences.check_downloads_reminder)
+    reminder = QTimer(app, interval=6 * 3600 * 1000)
+    reminder.timeout.connect(fences.check_downloads_reminder)
+    reminder.start()
     state = {"win": None}
 
     def open_manager():
@@ -3651,8 +3925,15 @@ def run_app(app: QApplication, args) -> None:
 
     def on_connection():
         conn = server.nextPendingConnection()
-        if conn.waitForReadyRead(300) and bytes(conn.readAll()) == b"show":
+        data = b""
+        while conn.waitForReadyRead(300):
+            data += bytes(conn.readAll())
+        if data == b"show":
             open_manager()
+        elif data.startswith(b"organize:"):
+            folder = Path(data[len(b"organize:"):].decode("utf-8", "replace"))
+            if folder.is_dir():
+                fences.open_organizer(folder)
         conn.close()
 
     server.newConnection.connect(on_connection)
@@ -3664,11 +3945,14 @@ def run_app(app: QApplication, args) -> None:
         tray.activated.connect(lambda reason: open_manager()
                                if reason == QSystemTrayIcon.Trigger else None)
         fences.notify.connect(lambda title, text: tray.showMessage(
-            title, text, QSystemTrayIcon.Information, 3000))
+            title, text, QSystemTrayIcon.Information, 5000))
+        tray.messageClicked.connect(fences.message_clicked)
         tray.show()
         app._tray = tray                # Referenz halten
 
-    if not args.background or not fences.fences:
+    if args.organize_folder:
+        fences.open_organizer(args.organize_folder)
+    elif not args.background or not fences.fences:
         open_manager()
     sys.exit(app.exec())
 
