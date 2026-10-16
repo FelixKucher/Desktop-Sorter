@@ -651,7 +651,8 @@ def _isolate_qt() -> None:
 _isolate_qt()
 
 from PySide6.QtCore import (QFileInfo, QFileSystemWatcher, QMimeData, QObject, QPoint,
-                            QPointF, QRect, QRectF, QSize, Qt, QThread, QTimer, QUrl,
+                            QPointF, QPropertyAnimation, QRect, QRectF, QSize, Qt, QThread,
+                            QTimer, QUrl,
                             Signal)
 from PySide6.QtGui import (QBrush, QColor, QDesktopServices, QDrag, QFont, QIcon,
                            QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
@@ -1577,6 +1578,7 @@ class MainWindow(_Base):
         except SystemExit as e:
             return self.message("Rückgängig", str(e), warn=True)
         if self.fences:
+            self.fences.mark_desktop_known()    # Zurückgelegtes nicht wieder einsortieren
             self.fences.sync()
         self.message("Rückgängig", out.getvalue().strip())
         self.rescan()
@@ -1603,37 +1605,186 @@ class MainWindow(_Base):
 
 
 # --------------------------------------------------------------------------- #
-# Glas-Boxen auf dem Desktop (Prinzip Stardock Fences)
+# Glas-Boxen auf dem Desktop — ein Stardock-Fences-Klon
 # --------------------------------------------------------------------------- #
-FENCE_TINT = 0x50201814         # AABBGGRR für Windows-Acrylic der Boxen
-FENCE_RADIUS = 8                # = Windows-11-Fensterecken
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+FENCE_RADIUS = 8                # = Windows-11-Fensterecken
+TINTS = {"Glas": None, "Blau": "#0A84FF", "Lila": "#BF5AF2", "Grün": "#30D158",
+         "Orange": "#FF9F0A", "Rot": "#FF453A", "Grau": "#8E8E93"}
+OPACITY = {"Hell": (55, 0x28), "Normal": (110, 0x50), "Dunkel": (175, 0x90)}  # Füllung, Acrylic
+ICON_SIZES = {"Klein": 32, "Mittel": 40, "Groß": 56}
+SORTS = ("Name", "Typ", "Neueste zuerst")
+BOX_DEFAULTS = {"tint": "Glas", "opacity": "Normal", "icons": "Mittel", "sort": "Name",
+                "collapsed": False}
+SETTINGS_DEFAULTS = {"autosort": True, "quickhide": True, "attach": True,
+                     "hover_expand": True, "snap": True}
+SETTING_LABELS = {
+    "autosort": "Neue Verknüpfungen automatisch einsortieren",
+    "quickhide": "Doppelklick auf den Desktop blendet Boxen aus",
+    "hover_expand": "Eingeklappte Boxen beim Überfahren öffnen",
+    "snap": "Boxen magnetisch ausrichten",
+    "attach": "An den Desktop heften (bleibt bei Win + D)",
+}
+PORTAL_LIMIT = 400              # mehr Einträge zeigt eine Ordner-Box nicht an
 
 
-def win_acrylic(hwnd: int, tint: int = FENCE_TINT) -> bool:
-    """Echter Acrylic-Blur hinter einem rahmenlosen Fenster + runde Ecken (Win11)."""
-    if os.name != "nt":
-        return False
-    import ctypes
-    from ctypes import wintypes
+# ---------- Windows-Anbindung (ctypes, ohne Zusatzpakete) ----------
+class Win32:
+    ok = os.name == "nt"
 
-    class ACCENT(ctypes.Structure):
-        _fields_ = [("AccentState", ctypes.c_int), ("AccentFlags", ctypes.c_int),
-                    ("GradientColor", wintypes.DWORD), ("AnimationId", ctypes.c_int)]
+    @staticmethod
+    def _u():
+        import ctypes
+        return ctypes.windll.user32
 
-    class WCA(ctypes.Structure):
-        _fields_ = [("Attribute", ctypes.c_int), ("Data", ctypes.POINTER(ACCENT)),
-                    ("SizeOfData", ctypes.c_size_t)]
+    @classmethod
+    def acrylic(cls, hwnd: int, color: QColor | None, alpha: int) -> bool:
+        """Acrylic-Blur hinter dem Fenster (Farbe + Alpha) und runde Ecken (Win11)."""
+        if not cls.ok:
+            return False
+        import ctypes
+        from ctypes import wintypes
 
-    try:
-        accent = ACCENT(4, 0, tint, 0)                 # 4 = ACRYLICBLURBEHIND
-        data = WCA(19, ctypes.pointer(accent), ctypes.sizeof(accent))  # 19 = ACCENT_POLICY
-        ok = bool(ctypes.windll.user32.SetWindowCompositionAttribute(hwnd, ctypes.byref(data)))
-        pref = ctypes.c_int(2)                         # DWMWCP_ROUND
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(pref), 4)
-        return ok
-    except (AttributeError, OSError):
-        return False
+        class ACCENT(ctypes.Structure):
+            _fields_ = [("AccentState", ctypes.c_int), ("AccentFlags", ctypes.c_int),
+                        ("GradientColor", wintypes.DWORD), ("AnimationId", ctypes.c_int)]
+
+        class WCA(ctypes.Structure):
+            _fields_ = [("Attribute", ctypes.c_int), ("Data", ctypes.POINTER(ACCENT)),
+                        ("SizeOfData", ctypes.c_size_t)]
+
+        c = color or QColor(20, 24, 32)
+        abgr = (alpha << 24) | (c.blue() << 16) | (c.green() << 8) | c.red()
+        try:
+            accent = ACCENT(4, 0, abgr, 0)                       # ACRYLICBLURBEHIND
+            data = WCA(19, ctypes.pointer(accent), ctypes.sizeof(accent))
+            ok = bool(cls._u().SetWindowCompositionAttribute(hwnd, ctypes.byref(data)))
+            pref = ctypes.c_int(2)                               # DWMWCP_ROUND
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(pref), 4)
+            return ok
+        except (AttributeError, OSError):
+            return False
+
+    @classmethod
+    def attach_to_desktop(cls, hwnd: int, on: bool) -> None:
+        """Progman als Besitzer setzen: „Desktop anzeigen“ (Win + D) blendet dann
+        die Box nicht aus, sie bleibt aber ein eigenständiges Fenster (Acrylic)."""
+        if not cls.ok:
+            return
+        import ctypes
+        u = cls._u()
+        u.FindWindowW.restype = ctypes.c_void_p
+        u.SetWindowLongPtrW.restype = ctypes.c_void_p
+        u.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        owner = u.FindWindowW("Progman", None) if on else None
+        u.SetWindowLongPtrW(hwnd, -8, owner)                     # GWLP_HWNDPARENT
+
+    @classmethod
+    def left_button_down(cls) -> bool:
+        if not cls.ok:
+            return bool(QApplication.mouseButtons() & Qt.LeftButton)
+        return bool(cls._u().GetAsyncKeyState(0x01) & 0x8000)
+
+    @classmethod
+    def desktop_listview_at(cls, x: int, y: int) -> int:
+        """Handle der Desktop-Symbolliste unter dem Punkt, sonst 0."""
+        if not cls.ok:
+            return 0
+        import ctypes
+        from ctypes import wintypes
+        u = cls._u()
+        u.WindowFromPoint.restype = ctypes.c_void_p
+        u.WindowFromPoint.argtypes = [wintypes.POINT]
+        u.GetParent.restype = ctypes.c_void_p
+        u.GetParent.argtypes = [ctypes.c_void_p]
+        u.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+        hwnd = u.WindowFromPoint(wintypes.POINT(x, y))
+
+        def cls_name(h):
+            buf = ctypes.create_unicode_buffer(64)
+            u.GetClassNameW(h, buf, 64)
+            return buf.value
+
+        if hwnd and cls_name(hwnd) == "SysListView32":
+            parent = u.GetParent(hwnd)
+            if parent and cls_name(parent) == "SHELLDLL_DefView":
+                return hwnd
+        return 0
+
+    @classmethod
+    def selected_count(cls, listview: int) -> int:
+        import ctypes
+        u = cls._u()
+        u.SendMessageW.restype = ctypes.c_ssize_t
+        u.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t,
+                                   ctypes.c_ssize_t]
+        return int(u.SendMessageW(listview, 0x1032, 0, 0))     # LVM_GETSELECTEDCOUNT
+
+
+class DesktopDoubleClick(QObject):
+    """Globaler Maus-Hook (WH_MOUSE_LL) in eigenem Thread; meldet Doppelklicks.
+    Ob der Doppelklick auf eine freie Desktopfläche ging, prüft der Empfänger."""
+    doubleClicked = Signal(int, int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._thread_id = 0
+
+    def start(self):
+        if not Win32.ok or self._thread_id:
+            return
+        import threading
+        threading.Thread(target=self._run, daemon=True, name="desktop-hook").start()
+
+    def stop(self):
+        if self._thread_id:
+            import ctypes
+            ctypes.windll.user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)  # WM_QUIT
+            self._thread_id = 0
+
+    def _run(self):
+        import ctypes
+        from ctypes import wintypes
+        u, k = ctypes.windll.user32, ctypes.windll.kernel32
+
+        class MSLL(ctypes.Structure):
+            _fields_ = [("pt", wintypes.POINT), ("mouseData", wintypes.DWORD),
+                        ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                        ("extra", ctypes.c_size_t)]
+
+        LRESULT = ctypes.c_ssize_t
+        HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+        u.CallNextHookEx.restype = LRESULT
+        u.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM,
+                                     wintypes.LPARAM]
+        u.SetWindowsHookExW.restype = ctypes.c_void_p
+        u.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, ctypes.c_void_p, wintypes.DWORD]
+        k.GetModuleHandleW.restype = ctypes.c_void_p
+        dbl_ms = u.GetDoubleClickTime()
+        cx, cy = u.GetSystemMetrics(36), u.GetSystemMetrics(37)   # SM_CXDOUBLECLK/CY
+        last = [0, 0, 0]
+
+        def proc(code, wparam, lparam):
+            if code == 0 and wparam == 0x0201:                      # WM_LBUTTONDOWN
+                m = ctypes.cast(lparam, ctypes.POINTER(MSLL)).contents
+                t, x, y = m.time, m.pt.x, m.pt.y
+                if (t - last[0] <= dbl_ms and abs(x - last[1]) <= cx
+                        and abs(y - last[2]) <= cy):
+                    last[0] = 0
+                    self.doubleClicked.emit(x, y)                   # → Qt-Hauptthread
+                else:
+                    last[:] = [t, x, y]
+            return u.CallNextHookEx(None, code, wparam, lparam)
+
+        self._proc = HOOKPROC(proc)                                 # Referenz halten!
+        hook = u.SetWindowsHookExW(14, self._proc, k.GetModuleHandleW(None), 0)
+        if not hook:
+            return
+        self._thread_id = k.GetCurrentThreadId()
+        msg = wintypes.MSG()
+        while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            pass
+        u.UnhookWindowsHookEx(ctypes.c_void_p(hook))
 
 
 def open_path(path: str) -> None:
@@ -1652,6 +1803,19 @@ def reveal_path(path: str) -> None:
 
 def display_name(p: Path) -> str:
     return p.stem if p.suffix.lower() in (".lnk", ".url") else p.name
+
+
+def inspect_paths(paths: list[Path]) -> list[Item]:
+    """Wie scan(), aber für einzelne neue Desktop-Verknüpfungen."""
+    items = [Item(p, "user", "url" if p.suffix.lower() == ".url" else "lnk") for p in paths]
+    lnks = resolve_lnks([i.path for i in items if i.kind == "lnk"])
+    for it in items:
+        if it.kind == "url":
+            it.target = read_url_file(it.path)
+        else:
+            t, a = lnks.get(str(it.path), ("", ""))
+            it.target = f"{t} {a}".strip()
+    return items
 
 
 # ---------- Autostart (Verknüpfung im Autostart-Ordner) ----------
@@ -1698,24 +1862,34 @@ class IconCache:
         return self.cache[key]
 
 
+def checked_menu(parent: QMenu, title: str, options, current, on_pick) -> QMenu:
+    sub = glass_menu(parent, title)
+    for opt in options:
+        act = sub.addAction(opt, lambda o=opt: on_pick(o))
+        act.setCheckable(True)
+        act.setChecked(opt == current)
+    parent.addMenu(sub)
+    return sub
+
+
+# ---------- Box ----------
 class FenceList(QListWidget):
     """Symbolraster einer Box. Klick startet, Ziehen verschiebt die Datei
-    (in eine andere Box oder – via Explorer – zurück auf den Desktop)."""
+    (in eine andere Box oder – via Explorer – auf den Desktop)."""
     launched = Signal(str)
     filesDropped = Signal(list)
     menuRequested = Signal(str, QPoint)
+    draggedOut = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("fence")
         self.setViewMode(QListView.IconMode)
         self.setMovement(QListView.Static)
         self.setResizeMode(QListView.Adjust)
         self.setWrapping(True)
         self.setWordWrap(True)
         self.setTextElideMode(Qt.ElideRight)
-        self.setObjectName("fence")
-        self.setIconSize(QSize(40, 40))
-        self.setGridSize(QSize(88, 90))
         self.setSelectionMode(QAbstractItemView.SingleSelection)
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
@@ -1729,13 +1903,23 @@ class FenceList(QListWidget):
         self.customContextMenuRequested.connect(self._menu)
         self.itemClicked.connect(self._clicked)
         self._last = ("", 0.0)
+        self.set_icon_size(40)
+
+    def set_icon_size(self, px: int):
+        self.icon_px = px
+        self.setIconSize(QSize(px, px))
+        self._regrid()
+
+    def _regrid(self):
+        # Spalten gleichmäßig über die Boxbreite verteilen; Platz für eine
+        # evtl. eingeblendete Scrollleiste (8 px) ist reserviert.
+        w = max(1, self.width() - 2 * self.frameWidth() - 12)
+        min_cell = self.icon_px + 40
+        cols = max(1, w // min_cell)
+        self.setGridSize(QSize(w // cols, self.icon_px + 50))
 
     def resizeEvent(self, e):
-        # Spalten gleichmäßig über die Boxbreite verteilen (≥ 80 px je Symbol);
-        # Platz für eine evtl. eingeblendete Scrollleiste (8 px) ist reserviert.
-        w = self.width() - 2 * self.frameWidth() - 12
-        cols = max(1, w // 80)
-        self.setGridSize(QSize(w // cols, 90))
+        self._regrid()
         super().resizeEvent(e)
 
     def _clicked(self, it):
@@ -1750,17 +1934,20 @@ class FenceList(QListWidget):
         it = self.currentItem()
         if not it:
             return
+        path = it.data(Qt.UserRole)
         md = QMimeData()
-        md.setUrls([QUrl.fromLocalFile(it.data(Qt.UserRole))])
+        md.setUrls([QUrl.fromLocalFile(path)])
         drag = QDrag(self)
         drag.setMimeData(md)
         drag.setPixmap(it.icon().pixmap(48, 48))
         drag.setHotSpot(QPoint(24, 24))
         drag.exec(Qt.MoveAction | Qt.CopyAction, Qt.MoveAction)
+        if not Path(path).exists():          # vom Explorer/Desktop übernommen
+            self.draggedOut.emit(path)
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls() and e.source() is not self:
-            e.setDropAction(Qt.CopyAction)      # wir verschieben selbst; Quelle löscht nichts
+            e.setDropAction(Qt.CopyAction)   # wir verschieben selbst; Quelle löscht nichts
             e.accept()
         else:
             e.ignore()
@@ -1784,14 +1971,15 @@ class Fence(QWidget):
     """Eine Glas-Box auf dem Desktop."""
     TITLE = 34
 
-    def __init__(self, mgr: "FenceManager", name: str):
+    def __init__(self, mgr: "FenceManager", name: str, folder: Path, portal: bool):
         super().__init__(None, Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnBottomHint)
-        self.mgr, self.name = mgr, name
+        self.mgr, self.name, self.folder, self.portal = mgr, name, folder, portal
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAcceptDrops(True)
         self.setWindowTitle(name)
-        self.collapsed, self.full_h, self.count = False, 260, 0
+        self.count, self.full_h, self.peek = 0, 250, False
         self._acrylic = False
+        self._visual_collapsed = False
         self.setMinimumSize(150, self.TITLE)
 
         lay = QVBoxLayout(self)
@@ -1800,6 +1988,7 @@ class Fence(QWidget):
         self.list.launched.connect(mgr.launch)
         self.list.filesDropped.connect(lambda ps: mgr.move_to(ps, self.name))
         self.list.menuRequested.connect(lambda p, pos: mgr.item_menu(self, p, pos))
+        self.list.draggedOut.connect(mgr.note_returned)
         lay.addWidget(self.list)
         self.grip = QSizeGrip(self)
         self.grip.setFixedSize(14, 14)
@@ -1807,14 +1996,42 @@ class Fence(QWidget):
 
         self._save = QTimer(self, singleShot=True, interval=400)
         self._save.timeout.connect(lambda: mgr.save_geometry(self))
+        self._snap = QTimer(self, singleShot=True, interval=220)
+        self._snap.timeout.connect(self._snap_when_released)
+        self._unpeek = QTimer(self, singleShot=True, interval=450)
+        self._unpeek.timeout.connect(self._end_peek)
+        self.apply_style()
+
+    # ----- Einstellungen dieser Box -----
+    @property
+    def st(self) -> dict:
+        return self.mgr.box_cfg(self.name)
+
+    def apply_style(self):
+        self.list.set_icon_size(ICON_SIZES.get(self.st["icons"], 40))
+        if self._acrylic or self.isVisible():
+            self._apply_acrylic()
+        self.update()
+
+    def _apply_acrylic(self):
+        tint = TINTS.get(self.st["tint"])
+        alpha = OPACITY.get(self.st["opacity"], OPACITY["Normal"])[1]
+        self._acrylic = Win32.acrylic(int(self.winId()), QColor(tint) if tint else None, alpha)
 
     # ----- Inhalt -----
     def set_items(self, paths: list[Path]):
+        mode = self.st["sort"]
+        if mode == "Typ":
+            key = lambda q: (q.suffix.lower(), display_name(q).lower())
+        elif mode == "Neueste zuerst":
+            key = lambda q: -q.stat().st_mtime if q.exists() else 0
+        else:
+            key = lambda q: display_name(q).lower()
         self.list.clear()
-        for p in sorted(paths, key=lambda q: display_name(q).lower()):
+        for p in sorted(paths, key=key):
             it = QListWidgetItem(self.mgr.icons.get(p), display_name(p))
             it.setData(Qt.UserRole, str(p))
-            it.setToolTip(f"{display_name(p)}\nKlicken zum Starten")
+            it.setToolTip(f"{display_name(p)}\nKlicken zum Öffnen")
             self.list.addItem(it)
         self.count = len(paths)
         self.update()
@@ -1823,43 +2040,57 @@ class Fence(QWidget):
     def showEvent(self, e):
         super().showEvent(e)
         if not self._acrylic:
-            self._acrylic = win_acrylic(int(self.winId()))
+            self._apply_acrylic()
+        Win32.attach_to_desktop(int(self.winId()), self.mgr.settings["attach"])
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         r = QRectF(self.rect())
-        if not self._acrylic:                 # ohne Blur: dunkleres Milchglas
-            path = QPainterPath()
-            path.addRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), FENCE_RADIUS, FENCE_RADIUS)
-            p.fillPath(path, QColor(16, 18, 28, 120))
+        tint = TINTS.get(self.st["tint"])
+        fill_a = OPACITY.get(self.st["opacity"], OPACITY["Normal"])[0]
+        base = QColor(tint) if tint else QColor(16, 18, 28)
+        base.setAlpha(int(fill_a * (0.35 if self._acrylic else 1.0)))
+        path = QPainterPath()
+        path.addRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), FENCE_RADIUS, FENCE_RADIUS)
+        p.fillPath(path, base)
         paint_glass(p, r, FENCE_RADIUS, strength=0.9)
+
         f = self.font()
         f.setPixelSize(13)
         f.setWeight(QFont.DemiBold)
         p.setFont(f)
         p.setPen(Qt.white)
-        tr = QRectF(14, 0, self.width() - 60, self.TITLE)
+        title = ("↗ " if self.portal else "") + self.name
+        tr = QRectF(14, 0, self.width() - 64, self.TITLE)
         p.drawText(tr, Qt.AlignVCenter | Qt.AlignLeft,
-                   p.fontMetrics().elidedText(self.name, Qt.ElideRight, int(tr.width())))
+                   p.fontMetrics().elidedText(title, Qt.ElideRight, int(tr.width())))
         f.setWeight(QFont.Normal)
         f.setPixelSize(11)
         p.setFont(f)
         p.setPen(TEXT_2)
-        p.drawText(QRectF(self.width() - 46, 0, 32, self.TITLE), Qt.AlignVCenter | Qt.AlignRight,
-                   f"{self.count}" + (" ▸" if self.collapsed else ""))
-        if not self.collapsed:
+        p.drawText(QRectF(self.width() - 50, 0, 36, self.TITLE), Qt.AlignVCenter | Qt.AlignRight,
+                   f"{self.count}" + (" ▸" if self._visual_collapsed else ""))
+        if not self._visual_collapsed:
             p.setPen(QPen(QColor(255, 255, 255, 40), 1))
             p.drawLine(QPointF(12, self.TITLE), QPointF(self.width() - 12, self.TITLE))
 
     def resizeEvent(self, e):
         self.grip.move(self.width() - self.grip.width() - 2, self.height() - self.grip.height() - 2)
-        if not self.collapsed:
+        if not self._visual_collapsed:
             self.full_h = self.height()
         self._save.start()
 
     def moveEvent(self, e):
         self._save.start()
+        if self.mgr.settings["snap"]:
+            self._snap.start()
+
+    def _snap_when_released(self):
+        if Win32.left_button_down():            # Nutzer zieht noch
+            self._snap.start()
+        else:
+            self.mgr.snap(self)
 
     # ----- Maus: Titelleiste -----
     def _on_title(self, e) -> bool:
@@ -1875,35 +2106,63 @@ class Fence(QWidget):
             self.move(e.globalPosition().toPoint() - self._drag_from)
 
     def mouseReleaseEvent(self, e):
-        self._drag_from = None
+        if getattr(self, "_drag_from", None) is not None:
+            self._drag_from = None
+            if self.mgr.settings["snap"]:
+                self.mgr.snap(self)
 
     def mouseDoubleClickEvent(self, e):
         if self._on_title(e):
-            self.set_collapsed(not self.collapsed)
+            self.set_collapsed(not self.st["collapsed"])
 
     def contextMenuEvent(self, e):
         if e.pos().y() <= self.TITLE:
             self.mgr.fence_menu(self, e.globalPos())
 
-    def set_collapsed(self, on: bool, save=True):
-        if on == self.collapsed:
+    # ----- Einklappen & Aufklappen beim Überfahren -----
+    def _show_collapsed(self, on: bool):
+        if on == self._visual_collapsed:
             return
         if on:
             self.full_h = self.height()
-        self.collapsed = on
+        self._visual_collapsed = on
         self.list.setVisible(not on)
         self.grip.setVisible(not on)
         self.setMinimumHeight(self.TITLE if on else 80)
         self.resize(self.width(), self.TITLE if on else self.full_h)
         self.update()
+
+    def set_collapsed(self, on: bool, save=True):
+        self.peek = False
+        self.st["collapsed"] = on
+        self._show_collapsed(on)
         if save:
             self._save.start()
+
+    def enterEvent(self, e):
+        self._unpeek.stop()
+        if self.st["collapsed"] and self.mgr.settings["hover_expand"] and not self.peek:
+            self.peek = True
+            self._show_collapsed(False)
+
+    def leaveEvent(self, e):
+        if self.peek:
+            self._unpeek.start()
+
+    def _end_peek(self):
+        if self.peek and not self.underMouse():
+            self.peek = False
+            self._show_collapsed(True)
 
     # ----- Drop auf Titelleiste/Rand -----
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
             e.setDropAction(Qt.CopyAction)
             e.accept()
+            self.enterEvent(e)                  # eingeklappte Box beim Ziehen öffnen
+
+    def dragLeaveEvent(self, e):
+        self.leaveEvent(e)
 
     def dropEvent(self, e):
         paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
@@ -1913,100 +2172,312 @@ class Fence(QWidget):
             self.mgr.move_to(paths, self.name)
 
 
+# ---------- Verwaltung aller Boxen ----------
 class FenceManager(QObject):
-    """Hält eine Box pro Unterordner von STORAGE_DIR und folgt Änderungen live."""
+    """Eine Box pro Unterordner von STORAGE_DIR plus Ordner-Portale; folgt Änderungen
+    live, sortiert neue Desktop-Verknüpfungen ein und reagiert auf Quick-Hide."""
     openManager = Signal()
-    changed = Signal()
+    visibilityChanged = Signal(bool)
+    notify = Signal(str, str)
 
-    def __init__(self, storage: Path):
+    def __init__(self, storage: Path, rules_path: Path | None = None,
+                 memory_path: Path | None = None):
         super().__init__()
         self.storage = storage
         self.storage.mkdir(parents=True, exist_ok=True)
+        self.rules_path, self.memory_path = rules_path, memory_path
         self.cfg_path = storage / ".boxen.json"
-        try:
-            self.cfg = json.loads(self.cfg_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            self.cfg = {}
+        self.cfg = self._load_cfg()
         self.fences: dict[str, Fence] = {}
         self.icons = IconCache()
         self.visible = True
+        self._anims = []
+        self._worker: Worker | None = None
+
         self.watcher = QFileSystemWatcher(self)
         self._sync = QTimer(self, singleShot=True, interval=300)
         self._sync.timeout.connect(self.sync)
         self.watcher.directoryChanged.connect(lambda _: self._sync.start())
 
-    # ----- Abgleich mit dem Dateisystem -----
-    def group_dirs(self) -> dict[str, Path]:
-        if not self.storage.is_dir():
-            return {}
-        return {d.name: d for d in sorted(self.storage.iterdir())
-                if d.is_dir() and not d.name.startswith(".")}
+        # Neue Desktop-Verknüpfungen erkennen
+        self.returned: set[str] = set()
+        self.desktops: list[Path] = []
+        self.desk_known: set[str] = set()
+        self.desk_watch = QFileSystemWatcher(self)
+        self._auto = QTimer(self, singleShot=True, interval=2000)
+        self._auto.timeout.connect(self._autosort)
+        self.desk_watch.directoryChanged.connect(lambda _: self._auto.start())
+        self.watch_desktop()
 
-    def names(self) -> list[str]:
-        return list(self.group_dirs())
+        # Quick-Hide: Doppelklick auf freie Desktopfläche
+        self.hook = DesktopDoubleClick(self)
+        self.hook.doubleClicked.connect(self._desktop_double_click)
+        if self.settings["quickhide"]:
+            self.hook.start()
 
-    def sync(self):
-        dirs = self.group_dirs()
-        for name in [n for n in self.fences if n not in dirs]:
-            self.fences.pop(name).deleteLater()
-        for i, (name, d) in enumerate(dirs.items()):
-            fence = self.fences.get(name)
-            if fence is None:
-                fence = self.fences[name] = Fence(self, name)
-                self._place(fence, i)
-                if self.visible:
-                    fence.show()
-            fence.set_items([p for p in d.iterdir()
-                             if p.name.lower() != "desktop.ini" and not p.name.startswith(".")])
-        if self.watcher.directories():
-            self.watcher.removePaths(self.watcher.directories())
-        self.watcher.addPaths([str(self.storage)] + [str(d) for d in dirs.values()])
-        self.changed.emit()
+        # Bildschirmänderungen (Auflösung, Monitor ab-/angesteckt)
+        app = QApplication.instance()
+        app.screenAdded.connect(lambda _: QTimer.singleShot(500, self.ensure_on_screen))
+        app.screenRemoved.connect(lambda _: QTimer.singleShot(500, self.ensure_on_screen))
+        app.primaryScreen().availableGeometryChanged.connect(
+            lambda _: QTimer.singleShot(500, self.ensure_on_screen))
 
-    def _place(self, fence: Fence, index: int):
-        g = self.cfg.get(fence.name)
-        screen = QApplication.primaryScreen().availableGeometry()
-        if g:
-            rect = QRect(g["x"], g["y"], g["w"], g["h"])
-            on_screen = any(s.availableGeometry().intersects(rect)
-                            for s in QApplication.screens())
-            if on_screen:
-                fence.setGeometry(rect)
-                fence.full_h = g["h"]
-                if g.get("collapsed"):
-                    fence.set_collapsed(True, save=False)
-                return
-        # Neue Box: von rechts oben spaltenweise nach links (Desktop-Symbole sitzen links)
-        w, h, gap = 360, 250, 16
-        rows = max(1, (screen.height() - gap) // (h + gap))
-        col, row = divmod(index, rows)
-        fence.setGeometry(screen.right() - gap - w - col * (w + gap),
-                          screen.top() + gap + row * (h + gap), w, h)
+    # ----- Konfiguration -----
+    def _load_cfg(self) -> dict:
+        try:
+            raw = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = {}
+        if raw and "boxes" not in raw:            # altes Format: nur Geometrien
+            raw = {"boxes": raw}
+        raw.setdefault("boxes", {})
+        raw.setdefault("snapshots", {})
+        raw["settings"] = {**SETTINGS_DEFAULTS, **raw.get("settings", {})}
+        return raw
 
-    def save_geometry(self, fence: Fence):
-        if fence.name not in self.fences:
-            return
-        g = fence.geometry()
-        self.cfg[fence.name] = {"x": g.x(), "y": g.y(), "w": g.width(),
-                                "h": fence.full_h if fence.collapsed else g.height(),
-                                "collapsed": fence.collapsed}
-        self._write_cfg()
-
-    def _write_cfg(self):
+    def write_cfg(self):
         try:
             self.cfg_path.write_text(json.dumps(self.cfg, indent=2, ensure_ascii=False),
                                      encoding="utf-8")
         except OSError:
             pass
 
-    # ----- Aktionen -----
+    @property
+    def settings(self) -> dict:
+        return self.cfg["settings"]
+
+    def box_cfg(self, name: str) -> dict:
+        box = self.cfg["boxes"].setdefault(name, {})
+        for k, v in BOX_DEFAULTS.items():
+            box.setdefault(k, v)
+        return box
+
+    def set_setting(self, key: str, value: bool):
+        self.settings[key] = value
+        self.write_cfg()
+        if key == "quickhide":
+            self.hook.start() if value else self.hook.stop()
+        elif key == "attach":
+            for f in self.fences.values():
+                Win32.attach_to_desktop(int(f.winId()), value)
+        elif key == "hover_expand" and not value:
+            for f in self.fences.values():
+                f._end_peek()
+
+    # ----- Abgleich mit dem Dateisystem -----
+    def group_dirs(self) -> dict[str, Path]:
+        """Box-Ordner (ohne Portale) — Ziele fürs Einsortieren."""
+        if not self.storage.is_dir():
+            return {}
+        return {d.name: d for d in sorted(self.storage.iterdir())
+                if d.is_dir() and not d.name.startswith(".")}
+
+    def sources(self) -> dict[str, tuple[Path, bool]]:
+        src = {n: (d, False) for n, d in self.group_dirs().items()}
+        for name, box in self.cfg["boxes"].items():
+            portal = box.get("portal")
+            if portal and Path(portal).is_dir() and name not in src:
+                src[name] = (Path(portal), True)
+        return src
+
+    def names(self) -> list[str]:
+        return list(self.group_dirs())
+
+    def sync(self):
+        src = self.sources()
+        for name in [n for n in self.fences if n not in src]:
+            self.fences.pop(name).deleteLater()
+        for i, (name, (folder, portal)) in enumerate(src.items()):
+            fence = self.fences.get(name)
+            if fence is None or fence.folder != folder:
+                if fence:
+                    fence.deleteLater()
+                fence = self.fences[name] = Fence(self, name, folder, portal)
+                self._place(fence)
+                if self.visible:
+                    fence.show()
+            entries = [p for p in folder.iterdir()
+                       if p.name.lower() != "desktop.ini" and not p.name.startswith(".")
+                       and not (portal and is_hidden(p))]
+            fence.set_items(entries[:PORTAL_LIMIT] if portal else entries)
+        if self.watcher.directories():
+            self.watcher.removePaths(self.watcher.directories())
+        self.watcher.addPaths([str(self.storage)] + [str(f) for f, _ in src.values()])
+
+    def _place(self, fence: Fence):
+        box = fence.st
+        if "x" in box:
+            rect = QRect(box["x"], box["y"], box["w"], box["h"])
+            if any(s.availableGeometry().intersects(rect) for s in QApplication.screens()):
+                fence.setGeometry(rect)
+                fence.full_h = box["h"]
+                if box["collapsed"]:
+                    fence.set_collapsed(True, save=False)
+                return
+        fence.setGeometry(self._free_slot(fence))
+
+    def _free_slot(self, fence: Fence) -> QRect:
+        """Neue Box: von rechts oben spaltenweise nach links (Desktop-Symbole sitzen
+        links), erste Stelle ohne Überlappung mit anderen Boxen."""
+        screen = QApplication.primaryScreen().availableGeometry()
+        w, h, gap = 360, 250, 16
+        rows = max(1, (screen.height() - gap) // (h + gap))
+        taken = [f.geometry() for f in self.fences.values() if f is not fence and f.isVisible()]
+        for i in range(200):
+            col, row = divmod(i, rows)
+            r = QRect(screen.right() - gap - w - col * (w + gap),
+                      screen.top() + gap + row * (h + gap), w, h)
+            if r.left() < screen.left():
+                break
+            if not any(r.intersects(t) for t in taken):
+                return r
+        return QRect(screen.center().x() - w // 2, screen.center().y() - h // 2, w, h)
+
+    def save_geometry(self, fence: Fence):
+        if self.fences.get(fence.name) is not fence:
+            return
+        g = fence.geometry()
+        fence.st.update({"x": g.x(), "y": g.y(), "w": g.width(),
+                         "h": fence.full_h if fence._visual_collapsed else g.height()})
+        self.write_cfg()
+
+    def ensure_on_screen(self):
+        for f in self.fences.values():
+            if not any(s.availableGeometry().intersects(f.geometry())
+                       for s in QApplication.screens()):
+                f.setGeometry(self._free_slot(f))
+
+    def arrange_all(self):
+        for f in self.fences.values():
+            f.move(-10000, -10000)
+        for f in self.fences.values():
+            r = self._free_slot(f)
+            f.setGeometry(r.x(), r.y(), r.width(), f.height() if f.st["collapsed"] else r.height())
+            f.full_h = r.height()
+
+    # ----- Magnetisches Ausrichten -----
+    def snap(self, fence: Fence, threshold=14, gap=10):
+        g = fence.geometry()
+        screen = (fence.screen() or QApplication.primaryScreen()).availableGeometry()
+        others = [f.geometry() for f in self.fences.values() if f is not fence and f.isVisible()]
+        xs = [(screen.left() + gap, "l"), (screen.right() - gap + 1, "r")]
+        ys = [(screen.top() + gap, "t"), (screen.bottom() - gap + 1, "b")]
+        for o in others:
+            xs += [(o.right() + gap + 1, "l"), (o.left(), "l"), (o.left() - gap, "r"),
+                   (o.right() + 1, "r")]
+            ys += [(o.bottom() + gap + 1, "t"), (o.top(), "t"), (o.top() - gap, "b"),
+                   (o.bottom() + 1, "b")]
+
+        def best(edge_lo, edge_hi, cands):
+            moves = [(t - edge_lo) if side in "lt" else (t - edge_hi) for t, side in cands]
+            moves = [m for m in moves if abs(m) <= threshold]
+            return min(moves, key=abs) if moves else 0
+
+        dx = best(g.left(), g.right() + 1, xs)
+        dy = best(g.top(), g.bottom() + 1, ys)
+        if dx or dy:
+            fence.move(g.x() + dx, g.y() + dy)
+
+    # ----- Quick-Hide -----
+    def _desktop_double_click(self, x: int, y: int):
+        lv = Win32.desktop_listview_at(x, y)
+        if lv:   # kurz warten: Explorer hebt die Auswahl beim Klick ins Leere auf
+            QTimer.singleShot(90, lambda: Win32.selected_count(lv) == 0 and self.toggle_visible())
+
+    def toggle_visible(self):
+        self.set_visible(not self.visible)
+
+    def set_visible(self, on: bool, animate=True):
+        if on == self.visible:
+            return
+        self.visible = on
+        self._anims.clear()
+        for f in self.fences.values():
+            if not animate:
+                f.setVisible(on)
+                continue
+            if on:
+                f.setWindowOpacity(0.0)
+                f.show()
+            anim = QPropertyAnimation(f, b"windowOpacity", self)
+            anim.setDuration(160)
+            anim.setStartValue(f.windowOpacity() if not on else 0.0)
+            anim.setEndValue(1.0 if on else 0.0)
+            if not on:
+                anim.finished.connect(lambda f=f: (f.hide(), f.setWindowOpacity(1.0)))
+            anim.start()
+            self._anims.append(anim)
+        self.visibilityChanged.emit(on)
+
+    # ----- Automatisch einsortieren -----
+    def watch_desktop(self):
+        self.desktops = [d for d in desktop_dirs() if d.is_dir()]
+        if self.desk_watch.directories():
+            self.desk_watch.removePaths(self.desk_watch.directories())
+        if self.desktops:
+            self.desk_watch.addPaths([str(d) for d in self.desktops])
+        self.mark_desktop_known()
+
+    def _desktop_names(self) -> dict[str, Path]:
+        out = {}
+        for d in self.desktops:
+            try:
+                out.update({p.name: p for p in d.iterdir()})
+            except OSError:
+                pass
+        return out
+
+    def mark_desktop_known(self):
+        """Aktuellen Desktop als bekannt markieren (nach Rückgängig, Auflösen …)."""
+        self._auto.stop()
+        self.desk_known = set(self._desktop_names())
+
+    def note_returned(self, path: str):
+        self.returned.add(Path(path).name)
+
+    def _autosort(self):
+        current = self._desktop_names()
+        new = [p for n, p in current.items()
+               if n not in self.desk_known and n not in self.returned]
+        self.desk_known = set(current)
+        if not self.settings["autosort"] or (self._worker and self._worker.isRunning()):
+            return
+        cands = [p for p in new if p.suffix.lower() in (".lnk", ".url") and not is_hidden(p)]
+        targets = set(self.group_dirs())
+        if not cands or not targets:
+            return
+        rules = load_rules(self.rules_path)
+        memory = Memory(self.memory_path) if self.memory_path else None
+        if memory:
+            rules = rules + memory.rules()
+
+        def job():
+            out = []
+            for it in inspect_paths(cands):
+                classify(it, rules, memory)
+                if it.confidence in ("high", "medium", "user") and it.category in targets:
+                    out.append((str(it.path), it.category))
+            return out
+
+        def done(pairs):
+            for path, cat in pairs:
+                if Path(path).exists():
+                    self.move_to([path], cat, quiet=True)
+                    self.notify.emit("Automatisch einsortiert",
+                                     f"{display_name(Path(path))} → {cat}")
+
+        self._worker = Worker(job, self)
+        self._worker.done.connect(done)
+        self._worker.start()
+
+    # ----- Datei-Aktionen -----
     def launch(self, path: str):
         try:
             open_path(path)
         except OSError as e:
-            QMessageBox.warning(None, "Desktop Sorter", f"Konnte nicht starten:\n{path}\n\n{e}")
+            QMessageBox.warning(None, "Desktop Sorter", f"Konnte nicht öffnen:\n{path}\n\n{e}")
 
-    def _move(self, paths, folder: Path) -> list[str]:
+    def _move(self, paths, folder: Path, quiet=False) -> list[str]:
         failed = []
         for src in map(Path, paths):
             if not src.exists() or src.parent == folder:
@@ -2015,44 +2486,75 @@ class FenceManager(QObject):
                 shutil.move(str(src), str(unique_dest(folder, src.name)))
             except OSError as e:
                 failed.append(f"{src.name}: {e.strerror or e}")
-        if failed:
+        if failed and not quiet:
             QMessageBox.warning(None, "Desktop Sorter",
                                 "Nicht verschoben (öffentlicher Desktop braucht Adminrechte):\n\n"
                                 + "\n".join(failed))
         self._sync.start()
         return failed
 
-    def move_to(self, paths, name: str):
-        folder = self.storage / name
-        folder.mkdir(exist_ok=True)
-        self._move(paths, folder)
+    def folder_of(self, name: str) -> Path:
+        src = self.sources().get(name)
+        return src[0] if src else self.storage / name
+
+    def move_to(self, paths, name: str, quiet=False):
+        folder = self.folder_of(name)
+        folder.mkdir(parents=True, exist_ok=True)
+        self._move(paths, folder, quiet)
 
     def to_desktop(self, paths):
+        for p in paths:
+            self.note_returned(p)
         self._move(paths, desktop_dirs()[0])
 
+    # ----- Boxen anlegen / ändern -----
     def new_box(self, paths=()):
         name = ask_box_name("Neue Box", "")
-        if name:
+        if name and name not in self.sources():
             (self.storage / name).mkdir(exist_ok=True)
             if paths:
                 self.move_to(paths, name)
             self._sync.start()
 
+    def new_portal(self):
+        from PySide6.QtWidgets import QFileDialog
+        folder = QFileDialog.getExistingDirectory(None, "Ordner für die Ordner-Box wählen",
+                                                  str(Path.home()))
+        if not folder:
+            return
+        base = Path(folder).name or folder
+        name, n = base, 2
+        while name in self.sources():
+            name, n = f"{base} ({n})", n + 1
+        self.box_cfg(name)["portal"] = folder
+        self.write_cfg()
+        self.sync()
+
     def rename(self, fence: Fence):
         new = ask_box_name("Box umbenennen", fence.name)
-        if not new or new == fence.name or (self.storage / new).exists():
+        if not new or new == fence.name or new in self.sources():
             return
-        (self.storage / fence.name).rename(self.storage / new)
-        if fence.name in self.cfg:
-            self.cfg[new] = self.cfg.pop(fence.name)
+        if not fence.portal:
+            (self.storage / fence.name).rename(self.storage / new)
+            fence.folder = self.storage / new
+        self.cfg["boxes"][new] = self.cfg["boxes"].pop(fence.name, {})
         self.fences[new] = self.fences.pop(fence.name)
         fence.name = new
         fence.setWindowTitle(new)
         fence.update()
-        self._write_cfg()
+        self.write_cfg()
         self._sync.start()
 
     def dissolve(self, fence: Fence):
+        if fence.portal:
+            if QMessageBox.question(None, "Ordner-Box entfernen",
+                                    f"Ordner-Box „{fence.name}“ entfernen?\n"
+                                    f"Der Ordner und seine Dateien bleiben unverändert.") \
+                    == QMessageBox.Yes:
+                self.cfg["boxes"].pop(fence.name, None)
+                self.write_cfg()
+                self.sync()
+            return
         if QMessageBox.question(None, "Box auflösen",
                                 f"Alle {fence.count} Objekte aus „{fence.name}“ zurück auf den "
                                 f"Desktop legen und die Box entfernen?") != QMessageBox.Yes:
@@ -2060,41 +2562,136 @@ class FenceManager(QObject):
         folder = self.storage / fence.name
         if not self._move([str(p) for p in folder.iterdir()], desktop_dirs()[0]):
             shutil.rmtree(folder, ignore_errors=True)
-            self.cfg.pop(fence.name, None)
-            self._write_cfg()
+            self.cfg["boxes"].pop(fence.name, None)
+            self.write_cfg()
+        self.mark_desktop_known()
         self._sync.start()
 
-    def set_visible(self, on: bool):
-        self.visible = on
-        for f in self.fences.values():
-            f.setVisible(on)
+    def set_box_option(self, fence: Fence, key: str, value):
+        fence.st[key] = value
+        self.write_cfg()
+        fence.apply_style()
+        if key == "sort":
+            self._sync.start()
+
+    # ----- Layouts -----
+    def save_snapshot(self):
+        dlg = QInputDialog()
+        dlg.setWindowTitle("Layout speichern")
+        dlg.setLabelText("Name des Layouts:")
+        dlg.setTextValue(time.strftime("Layout %d.%m. %H:%M"))
+        dlg.setWindowFlag(Qt.WindowStaysOnTopHint)
+        if not dlg.exec() or not dlg.textValue().strip():
+            return
+        self.cfg["snapshots"][dlg.textValue().strip()] = {
+            n: {k: f.st[k] for k in ("x", "y", "w", "h", "collapsed") if k in f.st}
+            for n, f in self.fences.items()}
+        self.write_cfg()
+
+    def restore_snapshot(self, name: str):
+        for box, geo in self.cfg["snapshots"].get(name, {}).items():
+            f = self.fences.get(box)
+            if not f or "x" not in geo:
+                continue
+            f.set_collapsed(False, save=False)
+            f.setGeometry(geo["x"], geo["y"], geo["w"], geo["h"])
+            f.full_h = geo["h"]
+            f.set_collapsed(geo.get("collapsed", False))
+        self.ensure_on_screen()
+
+    def delete_snapshot(self, name: str):
+        self.cfg["snapshots"].pop(name, None)
+        self.write_cfg()
 
     # ----- Menüs -----
     def item_menu(self, fence: Fence, path: str, pos):
         m = glass_menu()
-        m.addAction("▶  Starten", lambda: self.launch(path))
+        m.addAction("▶  Öffnen", lambda: self.launch(path))
         m.addAction("↗  Dateispeicherort öffnen", lambda: reveal_path(path))
         sub = glass_menu(m, "Verschieben in")
-        for n in self.names():
+        for n in self.sources():
             if n != fence.name:
                 sub.addAction(n, lambda n=n: self.move_to([path], n))
         sub.addSeparator()
         sub.addAction("+  Neue Box …", lambda: self.new_box([path]))
         m.addMenu(sub)
-        m.addAction("⌂  Zurück auf den Desktop", lambda: self.to_desktop([path]))
+        m.addAction("⌂  Auf den Desktop legen", lambda: self.to_desktop([path]))
         m.exec(pos)
 
     def fence_menu(self, fence: Fence, pos):
         m = glass_menu()
-        m.addAction("▴  Ausklappen" if fence.collapsed else "▾  Einklappen",
-                    lambda: fence.set_collapsed(not fence.collapsed))
+        m.addAction("▴  Ausklappen" if fence.st["collapsed"] else "▾  Einklappen",
+                    lambda: fence.set_collapsed(not fence.st["collapsed"]))
+        look = glass_menu(m, "Darstellung")
+        checked_menu(look, "Farbe", TINTS, fence.st["tint"],
+                     lambda v: self.set_box_option(fence, "tint", v))
+        checked_menu(look, "Deckkraft", OPACITY, fence.st["opacity"],
+                     lambda v: self.set_box_option(fence, "opacity", v))
+        checked_menu(look, "Symbolgröße", ICON_SIZES, fence.st["icons"],
+                     lambda v: self.set_box_option(fence, "icons", v))
+        checked_menu(look, "Sortieren nach", SORTS, fence.st["sort"],
+                     lambda v: self.set_box_option(fence, "sort", v))
+        m.addMenu(look)
         m.addAction("✎  Umbenennen …", lambda: self.rename(fence))
-        m.addAction("+  Neue Box …", lambda: self.new_box())
-        m.addAction("⌂  Box auflösen (alles auf den Desktop)", lambda: self.dissolve(fence))
+        m.addAction("↗  Ordner im Explorer öffnen",
+                    lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(fence.folder))))
         m.addSeparator()
+        m.addAction("+  Neue Box …", lambda: self.new_box())
+        m.addAction("+  Neue Ordner-Box …", self.new_portal)
+        m.addSeparator()
+        m.addAction("⌂  Ordner-Box entfernen" if fence.portal
+                    else "⌂  Box auflösen (alles auf den Desktop)", lambda: self.dissolve(fence))
         m.addAction("✦  Desktop Sorter öffnen", self.openManager.emit)
-        m.addAction("⏻  Beenden", QApplication.quit)
         m.exec(pos)
+
+    def build_tray_menu(self, open_manager) -> QMenu:
+        menu = glass_menu()
+        menu.addAction("✦  Desktop Sorter öffnen", open_manager)
+        act_vis = menu.addAction("Boxen anzeigen")
+        act_vis.setCheckable(True)
+        act_vis.setChecked(self.visible)
+        act_vis.toggled.connect(lambda on: self.set_visible(on))
+        self.visibilityChanged.connect(act_vis.setChecked)
+        menu.addSeparator()
+        menu.addAction("+  Neue Box …", lambda: self.new_box())
+        menu.addAction("+  Neue Ordner-Box …", self.new_portal)
+        menu.addAction("▦  Boxen neu anordnen", self.arrange_all)
+
+        layouts = glass_menu(menu, "Layouts")
+        layouts.aboutToShow.connect(lambda: self._fill_layouts(layouts))
+        menu.addMenu(layouts)
+
+        prefs = glass_menu(menu, "Einstellungen")
+        for key, label in SETTING_LABELS.items():
+            if key == "attach" and not Win32.ok:
+                continue
+            act = prefs.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(self.settings[key])
+            act.toggled.connect(lambda on, k=key: self.set_setting(k, on))
+        if Win32.ok:
+            prefs.addSeparator()
+            act_auto = prefs.addAction("Mit Windows starten")
+            act_auto.setCheckable(True)
+            act_auto.setChecked(autostart_enabled())
+            act_auto.toggled.connect(set_autostart)
+        menu.addMenu(prefs)
+        menu.addSeparator()
+        menu.addAction("⏻  Beenden", QApplication.quit)
+        return menu
+
+    def _fill_layouts(self, menu: QMenu):
+        menu.clear()
+        menu.addAction("💾  Aktuelles Layout speichern …", self.save_snapshot)
+        names = list(self.cfg["snapshots"])
+        if names:
+            menu.addSeparator()
+            for n in names:
+                menu.addAction(f"↺  {n}", lambda n=n: self.restore_snapshot(n))
+            dele = glass_menu(menu, "Layout löschen")
+            for n in names:
+                dele.addAction(n, lambda n=n: self.delete_snapshot(n))
+            menu.addMenu(dele)
 
 
 def ask_box_name(title: str, text: str) -> str | None:
@@ -2218,8 +2815,9 @@ def run_app(app: QApplication, args) -> None:
     server.listen(server_name)
 
     app.setQuitOnLastWindowClosed(False)
-    fences = FenceManager(args.storage)
+    fences = FenceManager(args.storage, args.rules, args.memory)
     fences.sync()
+    app.aboutToQuit.connect(fences.hook.stop)
     state = {"win": None}
 
     def open_manager():
@@ -2245,23 +2843,11 @@ def run_app(app: QApplication, args) -> None:
     if QSystemTrayIcon.isSystemTrayAvailable():
         tray = QSystemTrayIcon(app_icon(), app)
         tray.setToolTip("Desktop Sorter")
-        menu = glass_menu()
-        menu.addAction("✦  Desktop Sorter öffnen", open_manager)
-        menu.addAction("+  Neue Box …", lambda: fences.new_box())
-        act_vis = menu.addAction("Boxen anzeigen")
-        act_vis.setCheckable(True)
-        act_vis.setChecked(True)
-        act_vis.toggled.connect(fences.set_visible)
-        if os.name == "nt":
-            act_auto = menu.addAction("Mit Windows starten")
-            act_auto.setCheckable(True)
-            act_auto.setChecked(autostart_enabled())
-            act_auto.toggled.connect(set_autostart)
-        menu.addSeparator()
-        menu.addAction("⏻  Beenden", app.quit)
-        tray.setContextMenu(menu)
+        tray.setContextMenu(fences.build_tray_menu(open_manager))
         tray.activated.connect(lambda reason: open_manager()
                                if reason == QSystemTrayIcon.Trigger else None)
+        fences.notify.connect(lambda title, text: tray.showMessage(
+            title, text, QSystemTrayIcon.Information, 3000))
         tray.show()
         app._tray = tray                # Referenz halten
 
