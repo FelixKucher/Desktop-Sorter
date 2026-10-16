@@ -654,8 +654,8 @@ from PySide6.QtCore import (QFileInfo, QFileSystemWatcher, QMimeData, QObject, Q
                             QPointF, QPropertyAnimation, QRect, QRectF, QSize, Qt, QThread,
                             QTimer, QUrl,
                             Signal)
-from PySide6.QtGui import (QBrush, QColor, QDesktopServices, QDrag, QFont, QIcon,
-                           QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
+from PySide6.QtGui import (QBrush, QColor, QCursor, QDesktopServices, QDrag, QFont, QIcon,
+                           QImage, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
                            QRadialGradient)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (QAbstractButton, QAbstractItemView, QApplication,
@@ -1152,8 +1152,10 @@ class MainWindow(_Base):
         self.memory = Memory(args.memory)
         self.toml_rules = load_rules(args.rules)
         self.items: list[Item] = []
-        self.icons: dict[str, QIcon] = {}
-        self.provider = QFileIconProvider()
+        self.icons = icon_cache()       # gemeinsam mit den Boxen, scharfe Shell-Symbole
+        self._icon_refresh = QTimer(self, singleShot=True, interval=350)
+        self._icon_refresh.timeout.connect(self._refresh_icons)
+        self.icons.updated.connect(lambda _: self._icon_refresh.start())
         self.selected: str | None = None
         self.user_dir: Path | None = None
         self._worker: Worker | None = None
@@ -1279,13 +1281,13 @@ class MainWindow(_Base):
 
     # ---------- Daten ----------
     def icon_for(self, it: Item) -> QIcon:
-        key = str(it.path)
-        if key not in self.icons:
-            ic = self.provider.icon(QFileInfo(key))
-            if ic.isNull() or not ic.availableSizes():
-                ic = letter_icon(it.label)
-            self.icons[key] = ic
-        return self.icons[key]
+        return self.icons.get(it.path)
+
+    def _refresh_icons(self):
+        """Nachgeladene Shell-Symbole übernehmen (nicht während eines Scans)."""
+        busy = self._worker is not None and self._worker.isRunning()
+        if self.isVisible() and self.items and not busy:
+            self.refresh()
 
     def known_groups(self, groups=None) -> list[str]:
         names = list(groups or []) + [c for c in CATEGORIES if c != "Sonstiges"]
@@ -1346,7 +1348,6 @@ class MainWindow(_Base):
 
         def done(res):
             self.user_dir, self.items = res
-            self.icons.clear()
             self.refresh()
 
         self.run_bg("Scanne Desktop …", job, done)
@@ -1847,19 +1848,185 @@ def set_autostart(on: bool) -> None:
                    capture_output=True, timeout=30, creationflags=NO_WINDOW)
 
 
-class IconCache:
+# ---------- Programmsymbole ----------
+def shell_image(path: str, size: int = 128) -> QImage | None:
+    """Symbol in hoher Auflösung direkt von der Windows-Shell (wie im Explorer).
+    Anders als QFileIconProvider liefert das für jede .url/.lnk ihr eigenes
+    Symbol (Qt cacht pro Dateiendung → alle Steam-.url sähen gleich aus) und
+    funktioniert auch für Store-Apps."""
+    if not Win32.ok:
+        return None
+    import ctypes
+    from ctypes import wintypes
+    shell32, gdi32, user32 = ctypes.windll.shell32, ctypes.windll.gdi32, ctypes.windll.user32
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
+                    ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
+
+    class SIZE(ctypes.Structure):
+        _fields_ = [("cx", ctypes.c_long), ("cy", ctypes.c_long)]
+
+    class BITMAP(ctypes.Structure):
+        _fields_ = [("bmType", ctypes.c_long), ("bmWidth", ctypes.c_long),
+                    ("bmHeight", ctypes.c_long), ("bmWidthBytes", ctypes.c_long),
+                    ("bmPlanes", ctypes.c_ushort), ("bmBitsPixel", ctypes.c_ushort),
+                    ("bmBits", ctypes.c_void_p)]
+
+    class BIH(ctypes.Structure):
+        _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_long),
+                    ("biHeight", ctypes.c_long), ("biPlanes", ctypes.c_ushort),
+                    ("biBitCount", ctypes.c_ushort), ("biCompression", ctypes.c_uint32),
+                    ("biSizeImage", ctypes.c_uint32), ("biXPelsPerMeter", ctypes.c_long),
+                    ("biYPelsPerMeter", ctypes.c_long), ("biClrUsed", ctypes.c_uint32),
+                    ("biClrImportant", ctypes.c_uint32)]
+
+    import uuid
+    u = uuid.UUID("bcc18b79-ba16-442f-80c4-8a59c30c463b")    # IShellItemImageFactory
+    iid = GUID(u.fields[0], u.fields[1], u.fields[2],
+               (ctypes.c_ubyte * 8).from_buffer_copy(u.bytes[8:]))
+    shell32.SHCreateItemFromParsingName.argtypes = [
+        ctypes.c_wchar_p, ctypes.c_void_p, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)]
+    factory = ctypes.c_void_p()
+    if shell32.SHCreateItemFromParsingName(path, None, ctypes.byref(iid),
+                                           ctypes.byref(factory)) != 0 or not factory:
+        return None
+    vtbl = ctypes.cast(factory, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+    get_image = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, SIZE, ctypes.c_int,
+                                   ctypes.POINTER(ctypes.c_void_p))(vtbl[3])
+    release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[2])
+    hbmp = ctypes.c_void_p()
+    try:
+        hr = get_image(factory, SIZE(size, size), 0x4, ctypes.byref(hbmp))   # SIIGBF_ICONONLY
+    finally:
+        release(factory)
+    if hr != 0 or not hbmp:
+        return None
+
+    gdi32.GetObjectW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+    gdi32.GetDIBits.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+                                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+    gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+    user32.GetDC.restype = ctypes.c_void_p
+    user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    try:
+        bm = BITMAP()
+        gdi32.GetObjectW(hbmp, ctypes.sizeof(bm), ctypes.byref(bm))
+        w, h = bm.bmWidth, abs(bm.bmHeight)
+        if w <= 0 or h <= 0:
+            return None
+        bih = BIH(ctypes.sizeof(BIH), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)  # 32 bpp, top-down
+        buf = ctypes.create_string_buffer(w * h * 4)
+        hdc = user32.GetDC(None)
+        rows = gdi32.GetDIBits(hdc, hbmp, 0, h, buf, ctypes.byref(bih), 0)
+        user32.ReleaseDC(None, hdc)
+    finally:
+        gdi32.DeleteObject(hbmp)
+    if rows != h:
+        return None
+    return image_from_bgra(buf.raw, w, h)
+
+
+def image_from_bgra(raw: bytes, w: int, h: int) -> QImage | None:
+    """32-bpp-Pixel der Shell → QImage. Ältere Symbole haben keinen Alphakanal
+    (alle Alpha-Bytes 0) – sie werden deckend übernommen statt unsichtbar."""
+    if not raw.strip(b"\0"):
+        return None                                         # komplett leer
+    if not raw[3::4].strip(b"\0"):                          # kein Alphakanal
+        return QImage(raw, w, h, w * 4, QImage.Format_RGB32).copy()
+    img = QImage(raw, w, h, w * 4, QImage.Format_ARGB32_Premultiplied).copy()
+    return _trim_icon(img)
+
+
+def _trim_icon(img: QImage) -> QImage:
+    """Kleines Symbol mitten in großer, transparenter Leinwand → zuschneiden."""
+    probe = img.scaled(32, 32, Qt.IgnoreAspectRatio, Qt.FastTransformation)
+    alpha = [[probe.pixelColor(x, y).alpha() for x in range(32)] for y in range(32)]
+    if not any(a > 8 for row in alpha for a in row):
+        return img
+    xs = [x for x in range(32) if any(alpha[y][x] > 8 for y in range(32))]
+    ys = [y for y in range(32) if any(alpha[y][x] > 8 for x in range(32))]
+    span = max(xs[-1] - xs[0], ys[-1] - ys[0]) + 1
+    if span >= 24:                                          # füllt die Fläche bereits
+        return img
+    sx, sy = img.width() / 32, img.height() / 32
+    side = int(span * max(sx, sy)) + 4
+    cx = int((xs[0] + xs[-1] + 1) / 2 * sx)
+    cy = int((ys[0] + ys[-1] + 1) / 2 * sy)
+    return img.copy(max(0, cx - side // 2), max(0, cy - side // 2), side, side)
+
+
+class IconLoader(QThread):
+    """Lädt Shell-Symbole im Hintergrund, damit Boxen sofort erscheinen."""
+    loaded = Signal(str, QImage)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        import queue
+        self.queue: "queue.Queue[str | None]" = queue.Queue()
+        self.start()
+
+    def request(self, path: str):
+        self.queue.put(path)
+
+    def stop(self):
+        self.queue.put(None)
+        self.wait(2000)
+
+    def run(self):
+        if Win32.ok:
+            import ctypes
+            ctypes.windll.ole32.CoInitializeEx(None, 0x2)   # Shell-Aufrufe brauchen STA
+        while True:
+            path = self.queue.get()
+            if path is None:
+                break
+            try:
+                img = shell_image(path)
+            except Exception:                               # noqa: BLE001 — Symbol optional
+                img = None
+            if img is not None and not img.isNull():
+                self.loaded.emit(path, img)
+
+
+class IconCache(QObject):
+    """Gemeinsamer Symbol-Speicher: sofort ein Platzhalter (Qt bzw. Buchstabe),
+    das scharfe Shell-Symbol folgt asynchron → Signal updated(path)."""
+    updated = Signal(str)
+
     def __init__(self):
+        super().__init__()
         self.provider = QFileIconProvider()
         self.cache: dict[str, QIcon] = {}
+        self.loader = IconLoader(self) if Win32.ok else None
+        if self.loader:
+            self.loader.loaded.connect(self._on_loaded)
+            QApplication.instance().aboutToQuit.connect(self.loader.stop)
 
-    def get(self, path: Path) -> QIcon:
+    def get(self, path) -> QIcon:
         key = str(path)
         if key not in self.cache:
             ic = self.provider.icon(QFileInfo(key))
             if ic.isNull() or not ic.availableSizes():
-                ic = letter_icon(display_name(path))
+                ic = letter_icon(display_name(Path(key)))
             self.cache[key] = ic
+            if self.loader:
+                self.loader.request(key)
         return self.cache[key]
+
+    def _on_loaded(self, path: str, img: QImage):
+        self.cache[path] = QIcon(QPixmap.fromImage(img))
+        self.updated.emit(path)
+
+
+_ICON_CACHE: IconCache | None = None
+
+
+def icon_cache() -> IconCache:
+    global _ICON_CACHE
+    if _ICON_CACHE is None:
+        _ICON_CACHE = IconCache()
+    return _ICON_CACHE
 
 
 def checked_menu(parent: QMenu, title: str, options, current, on_pick) -> QMenu:
@@ -1967,9 +2134,50 @@ class FenceList(QListWidget):
             self.menuRequested.emit(it.data(Qt.UserRole), self.viewport().mapToGlobal(pos))
 
 
+class ResizeGrip(QWidget):
+    """Sichtbarer Anfasser unten rechts: ziehen ändert Breite und Höhe der Box."""
+    SIZE = 20
+
+    def __init__(self, fence: "Fence"):
+        super().__init__(fence)
+        self.fence = fence
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setCursor(Qt.SizeFDiagCursor)
+        self.setToolTip("Ziehen, um die Größe zu ändern")
+        self._hover = False
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.fence.begin_resize(Qt.RightEdge | Qt.BottomEdge, e.globalPosition().toPoint())
+
+    def mouseMoveEvent(self, e):
+        self.fence.drag_resize(e.globalPosition().toPoint())
+
+    def mouseReleaseEvent(self, e):
+        self.fence.end_resize()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QPen(QColor(255, 255, 255, 230 if self._hover else 130), 1.6,
+                      Qt.SolidLine, Qt.RoundCap))
+        s = self.SIZE - 5                                   # drei diagonale Linien
+        for k in (4, 8, 12):
+            p.drawLine(QPointF(s - k, s), QPointF(s, s - k))
+
+
 class Fence(QWidget):
     """Eine Glas-Box auf dem Desktop."""
     TITLE = 34
+    EDGE = 7                    # Breite der greifbaren Ränder rechts/unten
 
     def __init__(self, mgr: "FenceManager", name: str, folder: Path, portal: bool):
         super().__init__(None, Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnBottomHint)
@@ -1980,19 +2188,21 @@ class Fence(QWidget):
         self.count, self.full_h, self.peek = 0, 250, False
         self._acrylic = False
         self._visual_collapsed = False
-        self.setMinimumSize(150, self.TITLE)
+        self._resize: tuple | None = None    # (Kanten, Start-Mausposition, Start-Geometrie)
+        self.setMinimumSize(170, 80)         # eingeklappt: Höhe = Titelleiste
+        self.setMouseTracking(True)          # Mauszeiger an den Rändern anpassen
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(6, self.TITLE + 2, 6, 6)
+        lay.setContentsMargins(6, self.TITLE + 2, self.EDGE, self.EDGE + 4)
         self.list = FenceList(self)
         self.list.launched.connect(mgr.launch)
         self.list.filesDropped.connect(lambda ps: mgr.move_to(ps, self.name))
         self.list.menuRequested.connect(lambda p, pos: mgr.item_menu(self, p, pos))
         self.list.draggedOut.connect(mgr.note_returned)
         lay.addWidget(self.list)
-        self.grip = QSizeGrip(self)
-        self.grip.setFixedSize(14, 14)
-        self.grip.setStyleSheet("background: transparent;")
+        self.grip = ResizeGrip(self)
+        self.grip.raise_()
+        mgr.icons.updated.connect(self.update_icon)
 
         self._save = QTimer(self, singleShot=True, interval=400)
         self._save.timeout.connect(lambda: mgr.save_geometry(self))
@@ -2036,6 +2246,13 @@ class Fence(QWidget):
         self.count = len(paths)
         self.update()
 
+    def update_icon(self, path: str):
+        """Scharfes Shell-Symbol ist nachgeladen → Platzhalter ersetzen."""
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if it.data(Qt.UserRole) == path:
+                it.setIcon(self.mgr.icons.get(path))
+
     # ----- Darstellung -----
     def showEvent(self, e):
         super().showEvent(e)
@@ -2076,7 +2293,8 @@ class Fence(QWidget):
             p.drawLine(QPointF(12, self.TITLE), QPointF(self.width() - 12, self.TITLE))
 
     def resizeEvent(self, e):
-        self.grip.move(self.width() - self.grip.width() - 2, self.height() - self.grip.height() - 2)
+        self.grip.move(self.width() - self.grip.width() - 1, self.height() - self.grip.height() - 1)
+        self.grip.raise_()
         if not self._visual_collapsed:
             self.full_h = self.height()
         self._save.start()
@@ -2092,20 +2310,74 @@ class Fence(QWidget):
         else:
             self.mgr.snap(self)
 
-    # ----- Maus: Titelleiste -----
+    # ----- Größe ändern (Anfasser unten rechts, rechter und unterer Rand) -----
+    def _edges_at(self, pos):
+        x, y = pos.x(), pos.y()
+        edges = Qt.Edge(0)
+        if x >= self.width() - self.EDGE:
+            edges |= Qt.RightEdge
+        if y >= self.height() - self.EDGE and not self._visual_collapsed:
+            edges |= Qt.BottomEdge
+        return edges
+
+    def begin_resize(self, edges, global_pos: QPoint):
+        if self._visual_collapsed:
+            edges &= ~Qt.BottomEdge
+        if not edges:
+            return
+        if self.peek:                      # beim Ziehen nicht wieder einklappen
+            self.set_collapsed(False)
+        if self.windowHandle().startSystemResize(edges):
+            return                         # Windows übernimmt (flüssig, mit Snap)
+        self._resize = (edges, global_pos, QRect(self.geometry()))
+
+    def drag_resize(self, global_pos: QPoint):
+        if not self._resize:
+            return
+        edges, start, geo = self._resize
+        d = global_pos - start
+        w = max(self.minimumWidth(), geo.width() + (d.x() if edges & Qt.RightEdge else 0))
+        h = max(self.minimumHeight(), geo.height() + (d.y() if edges & Qt.BottomEdge else 0))
+        self.resize(w, h)
+
+    def end_resize(self):
+        if self._resize:
+            self._resize = None
+            self.mgr.save_geometry(self)
+
+    # ----- Maus: Titelleiste + Ränder -----
     def _on_title(self, e) -> bool:
         return e.position().y() <= self.TITLE
 
     def mousePressEvent(self, e):
-        if e.button() == Qt.LeftButton and self._on_title(e):
+        if e.button() != Qt.LeftButton:
+            return
+        edges = self._edges_at(e.position().toPoint())
+        if edges:
+            self.begin_resize(edges, e.globalPosition().toPoint())
+        elif self._on_title(e):
             if not self.windowHandle().startSystemMove():      # Fallback: manuell ziehen
                 self._drag_from = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
     def mouseMoveEvent(self, e):
+        if self._resize:
+            self.drag_resize(e.globalPosition().toPoint())
+            return
         if getattr(self, "_drag_from", None) is not None and e.buttons() & Qt.LeftButton:
             self.move(e.globalPosition().toPoint() - self._drag_from)
+            return
+        edges = self._edges_at(e.position().toPoint())      # nur Zeiger anpassen
+        if edges == (Qt.RightEdge | Qt.BottomEdge):
+            self.setCursor(Qt.SizeFDiagCursor)
+        elif edges & Qt.RightEdge:
+            self.setCursor(Qt.SizeHorCursor)
+        elif edges & Qt.BottomEdge:
+            self.setCursor(Qt.SizeVerCursor)
+        else:
+            self.unsetCursor()
 
     def mouseReleaseEvent(self, e):
+        self.end_resize()
         if getattr(self, "_drag_from", None) is not None:
             self._drag_from = None
             if self.mgr.settings["snap"]:
@@ -2125,11 +2397,12 @@ class Fence(QWidget):
             return
         if on:
             self.full_h = self.height()
-        self._visual_collapsed = on
-        self.list.setVisible(not on)
+        target = self.TITLE if on else self.full_h   # vor setMinimumHeight merken: das
+        self._visual_collapsed = on                  # löst ein resizeEvent aus, das
+        self.list.setVisible(not on)                 # full_h sonst auf 80 setzen würde
         self.grip.setVisible(not on)
         self.setMinimumHeight(self.TITLE if on else 80)
-        self.resize(self.width(), self.TITLE if on else self.full_h)
+        self.resize(self.width(), target)
         self.update()
 
     def set_collapsed(self, on: bool, save=True):
@@ -2189,7 +2462,7 @@ class FenceManager(QObject):
         self.cfg_path = storage / ".boxen.json"
         self.cfg = self._load_cfg()
         self.fences: dict[str, Fence] = {}
-        self.icons = IconCache()
+        self.icons = icon_cache()
         self.visible = True
         self._anims = []
         self._worker: Worker | None = None
