@@ -1,0 +1,3 @@
+PySide6>=6.6
+PySideSix-Frameless-Window>=0.8
+anthropic>=1.0

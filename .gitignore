@@ -1,0 +1,8 @@
+# Persönliche Zuordnungen
+entscheidungen.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
