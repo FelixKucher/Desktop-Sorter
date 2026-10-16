@@ -23,7 +23,7 @@ Die Datei **nicht auf den Desktop** legen, sonst sortiert sie sich selbst mit ei
 
 1. **Zuordnen** im Hauptfenster: Gruppen erscheinen als Glaskarten, Unklares (orange **?**) ordnest du per Drag & Drop oder Rechtsklick zu.
 2. **In Boxen sortieren**: Die Verknüpfungen wandern in `%USERPROFILE%\DesktopSorter Boxen\<Gruppe>`, und für jede Gruppe erscheint eine Glas-Box auf dem Desktop.
-3. Die App läuft danach im **Infobereich** (Tray) weiter und hält die Boxen auf dem Desktop. Über das Tray-Menü: *Mit Windows starten* aktiviert den Autostart.
+3. Die App läuft danach im **Infobereich** (Tray) weiter und hält die Boxen auf dem Desktop. Sie trägt sich beim Start **automatisch in den Windows-Autostart** ein (startet dann nur Boxen + Tray, ohne Hauptfenster). Abschalten: Tray → *Einstellungen* → *Mit Windows starten*.
 
 ## Die Boxen
 
@@ -55,6 +55,23 @@ Position, Größe, Einklapp-Zustand und Darstellung jeder Box werden gespeichert
 | **Mehrere Bildschirme** | Boxen außerhalb des sichtbaren Bereichs (Auflösung geändert, Monitor abgesteckt) werden zurückgeholt |
 
 Alle Schalter liegen im Tray-Menü unter **Einstellungen**, Layouts unter **Layouts**.
+
+## Downloads aufräumen
+
+Tray → **🧹 Downloads aufräumen …** (oder bei einer Ordner-Box: Rechtsklick → *Ordner aufräumen …*). Jede Datei erscheint als Karte mit Vorschau – Bild, erste PDF-Seite, Textanfang oder Programmsymbol – samt Größe, Datum und Herkunft („von github.com“, aus dem Windows-Download-Vermerk).
+
+![Downloads aufräumen](docs/aufraeumen.png)
+
+| Aktion | Maus | Tastatur |
+|---|---|---|
+| In den Papierkorb | nach **links** wischen · ✕ | ← · Entf |
+| Behalten | nach **rechts** wischen · ✓ | → · Leertaste |
+| Öffnen / ansehen | ↗ | Enter · ↑ |
+| Rückgängig | ↶ | Strg + Z · Rücktaste |
+
+- Gelöscht wird **erst bei „Fertig“** (oder beim Schließen) und nur in den **Papierkorb** – alles bleibt wiederherstellbar; bis dahin ist jede Entscheidung rückgängig zu machen.
+- Behaltene Dateien werden beim nächsten Mal nicht erneut gezeigt (außer sie ändern sich). Schalter *Behaltene erneut zeigen* holt sie zurück.
+- Sortierung *Älteste zuerst* oder *Größte zuerst*; *Ordner …* räumt jeden anderen Ordner auf. Laufende Downloads (`.crdownload`) werden übersprungen.
 
 ## Zuordnungslogik
 

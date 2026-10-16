@@ -650,10 +650,9 @@ def _isolate_qt() -> None:
 
 _isolate_qt()
 
-from PySide6.QtCore import (QFileInfo, QFileSystemWatcher, QMimeData, QObject, QPoint,
+from PySide6.QtCore import (QFile, QFileInfo, QFileSystemWatcher, QMimeData, QObject, QPoint,
                             QPointF, QPropertyAnimation, QRect, QRectF, QSize, Qt, QThread,
-                            QTimer, QUrl,
-                            Signal)
+                            QTimer, QUrl, QVariantAnimation, Signal)
 from PySide6.QtGui import (QBrush, QColor, QCursor, QDesktopServices, QDrag, QFont, QIcon,
                            QImage, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
                            QRadialGradient)
@@ -1618,7 +1617,7 @@ SORTS = ("Name", "Typ", "Neueste zuerst")
 BOX_DEFAULTS = {"tint": "Glas", "opacity": "Normal", "icons": "Mittel", "sort": "Name",
                 "collapsed": False}
 SETTINGS_DEFAULTS = {"autosort": True, "quickhide": True, "attach": True,
-                     "hover_expand": True, "snap": True}
+                     "hover_expand": True, "snap": True, "autostart": True}
 SETTING_LABELS = {
     "autosort": "Neue Verknüpfungen automatisch einsortieren",
     "quickhide": "Doppelklick auf den Desktop blendet Boxen aus",
@@ -2528,7 +2527,9 @@ class FenceManager(QObject):
     def set_setting(self, key: str, value: bool):
         self.settings[key] = value
         self.write_cfg()
-        if key == "quickhide":
+        if key == "autostart":
+            set_autostart(value)
+        elif key == "quickhide":
             self.hook.start() if value else self.hook.stop()
         elif key == "attach":
             for f in self.fences.values():
@@ -2908,6 +2909,8 @@ class FenceManager(QObject):
         m.addAction("✎  Umbenennen …", lambda: self.rename(fence))
         m.addAction("↗  Ordner im Explorer öffnen",
                     lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(fence.folder))))
+        if fence.portal:
+            m.addAction("🧹  Ordner aufräumen …", lambda: self.open_cleaner(fence.folder))
         m.addSeparator()
         m.addAction("+  Neue Box …", lambda: self.new_box())
         m.addAction("+  Neue Ordner-Box …", self.new_portal)
@@ -2929,6 +2932,7 @@ class FenceManager(QObject):
         menu.addAction("+  Neue Box …", lambda: self.new_box())
         menu.addAction("+  Neue Ordner-Box …", self.new_portal)
         menu.addAction("▦  Boxen neu anordnen", self.arrange_all)
+        menu.addAction("🧹  Downloads aufräumen …", lambda: self.open_cleaner(downloads_dir()))
 
         layouts = glass_menu(menu, "Layouts")
         layouts.aboutToShow.connect(lambda: self._fill_layouts(layouts))
@@ -2946,12 +2950,20 @@ class FenceManager(QObject):
             prefs.addSeparator()
             act_auto = prefs.addAction("Mit Windows starten")
             act_auto.setCheckable(True)
-            act_auto.setChecked(autostart_enabled())
-            act_auto.toggled.connect(set_autostart)
+            act_auto.setChecked(self.settings["autostart"])
+            act_auto.toggled.connect(lambda on: self.set_setting("autostart", on))
         menu.addMenu(prefs)
         menu.addSeparator()
         menu.addAction("⏻  Beenden", QApplication.quit)
         return menu
+
+    def open_cleaner(self, folder: Path):
+        win = getattr(self, "_cleaner", None)
+        if win is None or not win.isVisible():
+            win = self._cleaner = CleanerWindow(self, folder)
+        win.show()
+        win.raise_()
+        win.activateWindow()
 
     def _fill_layouts(self, menu: QMenu):
         menu.clear()
@@ -2980,6 +2992,530 @@ def ask_box_name(title: str, text: str) -> str | None:
         QMessageBox.warning(None, "Ungültiger Name", "Dieser Name ist nicht erlaubt.")
         return None
     return name
+
+
+# --------------------------------------------------------------------------- #
+# Downloads aufräumen – Wischen wie bei Tinder
+# --------------------------------------------------------------------------- #
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff", ".ico", ".svg"}
+TEXT_EXT = {".txt", ".md", ".csv", ".tsv", ".json", ".log", ".py", ".ini", ".cfg", ".xml",
+            ".yaml", ".yml", ".toml", ".bat", ".ps1", ".sh", ".html", ".css", ".js"}
+SWIPE_THRESHOLD = 130
+
+
+def downloads_dir() -> Path:
+    return known_folder("374DE290-123F-4565-9164-39C4925E467B", Path.home() / "Downloads")
+
+
+def download_origin(path: Path) -> str:
+    """Herkunft eines Downloads aus dem NTFS-Stream Zone.Identifier (HostUrl)."""
+    if os.name != "nt" or path.is_dir():
+        return ""
+    try:
+        with open(str(path) + ":Zone.Identifier", encoding="utf-8", errors="ignore") as fh:
+            text = fh.read()
+    except OSError:
+        return ""
+    m = re.search(r"^(?:HostUrl|ReferrerUrl)=(\S+)", text, re.M)
+    if not m:
+        return ""
+    from urllib.parse import urlparse
+    host = urlparse(m.group(1)).hostname or ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def human_size(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}".replace(".", ",")
+        n /= 1024
+    return ""
+
+
+def path_size(p: Path, limit=20000) -> int:
+    if not p.is_dir():
+        try:
+            return p.stat().st_size
+        except OSError:
+            return 0
+    total = 0
+    for i, f in enumerate(p.rglob("*")):
+        if i > limit:
+            break
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def make_preview(path: Path, w: int, h: int) -> tuple[QPixmap | None, str]:
+    """Vorschau: Bild, erste PDF-Seite oder Textanfang; sonst (None, "")."""
+    ext = path.suffix.lower()
+    try:
+        if ext in IMAGE_EXT:
+            from PySide6.QtGui import QImageReader
+            reader = QImageReader(str(path))
+            reader.setAutoTransform(True)
+            size = reader.size()
+            if size.isValid():
+                reader.setScaledSize(size.scaled(w * 2, h * 2, Qt.KeepAspectRatio))
+            img = reader.read()
+            if not img.isNull():
+                return QPixmap.fromImage(img), ""
+        elif ext == ".pdf":
+            from PySide6.QtPdf import QPdfDocument
+            doc = QPdfDocument()
+            doc.load(str(path))
+            if doc.pageCount() > 0:
+                ps = doc.pagePointSize(0)
+                scale = min(w * 2 / max(ps.width(), 1), h * 2 / max(ps.height(), 1))
+                img = doc.render(0, QSize(int(ps.width() * scale), int(ps.height() * scale)))
+                if not img.isNull():                    # Seite ist transparent → auf Papier
+                    page = QImage(img.size(), QImage.Format_RGB32)
+                    page.fill(Qt.white)
+                    pp = QPainter(page)
+                    pp.drawImage(0, 0, img)
+                    pp.end()
+                    return QPixmap.fromImage(page), ""
+        elif ext in TEXT_EXT and path.stat().st_size < 50_000_000:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                return None, fh.read(1500)
+    except Exception:                                   # noqa: BLE001 — Vorschau optional
+        pass
+    return None, ""
+
+
+class SwipeCard(QWidget):
+    """Karte mit Vorschau. Ziehen nach links = Papierkorb, rechts = behalten."""
+    decided = Signal(str)                                # "trash" | "keep"
+    CW, CH = 400, 500
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.entry: dict | None = None
+        self.next_entry: dict | None = None
+        self.offset = 0.0
+        self._press: QPoint | None = None
+        self._anim = None
+        self.done_text = ""
+        self.setCursor(Qt.OpenHandCursor)
+        icon_cache().updated.connect(lambda _: self.update())
+
+    def set_entry(self, entry, next_entry):
+        self.entry, self.next_entry, self.offset = entry, next_entry, 0.0
+        self.update()
+
+    def card_rect(self) -> QRectF:
+        return QRectF((self.width() - self.CW) / 2, (self.height() - self.CH) / 2 - 6,
+                      self.CW, self.CH)
+
+    # ----- Wischen -----
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self.entry and not self._busy():
+            self._press = e.position().toPoint()
+            self.setCursor(Qt.ClosedHandCursor)
+
+    def mouseMoveEvent(self, e):
+        if self._press is not None:
+            self.offset = e.position().x() - self._press.x()
+            self.update()
+
+    def mouseReleaseEvent(self, e):
+        if self._press is None:
+            return
+        self._press = None
+        self.setCursor(Qt.OpenHandCursor)
+        if self.offset <= -SWIPE_THRESHOLD:
+            self.fly("trash")
+        elif self.offset >= SWIPE_THRESHOLD:
+            self.fly("keep")
+        else:
+            self._animate(0.0, 180)
+
+    def _busy(self) -> bool:
+        return self._anim is not None and self._anim.state() == QVariantAnimation.Running
+
+    def _animate(self, target: float, ms: int, then=None):
+        from PySide6.QtCore import QEasingCurve
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(float(self.offset))
+        self._anim.setEndValue(float(target))
+        self._anim.setDuration(ms)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._anim.valueChanged.connect(lambda v: (setattr(self, "offset", v), self.update()))
+        if then:
+            self._anim.finished.connect(then)
+        self._anim.start()
+
+    def fly(self, action: str):
+        if not self.entry or self._busy():
+            return
+        target = (-1.0 if action == "trash" else 1.0) * (self.width() + self.CW)
+        self._animate(target, 230, lambda: self.decided.emit(action))
+
+    # ----- Zeichnen -----
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        r = self.card_rect()
+        if not self.entry:
+            f = self.font()
+            f.setPixelSize(22)
+            f.setWeight(QFont.DemiBold)
+            p.setFont(f)
+            p.setPen(Qt.white)
+            p.drawText(self.rect(), Qt.AlignCenter, self.done_text or "Keine Dateien")
+            return
+        progress = min(1.0, abs(self.offset) / SWIPE_THRESHOLD)
+        if self.next_entry:                              # nächste Karte dahinter
+            p.save()
+            s = 0.94 + 0.06 * progress
+            p.translate(r.center())
+            p.scale(s, s)
+            p.translate(-r.center() + QPointF(0, 18 * (1 - progress)))
+            self._paint_card(p, r, self.next_entry, ghost=True)
+            p.restore()
+        p.save()
+        p.translate(r.center() + QPointF(self.offset, 0))
+        p.rotate(self.offset * 0.05)
+        p.translate(-r.center())
+        self._paint_card(p, r, self.entry)
+        if self.offset:                                  # Stempel
+            trash = self.offset < 0
+            col = QColor("#FF453A" if trash else "#30D158")
+            col.setAlpha(int(255 * progress))
+            p.save()
+            p.translate(r.left() + (r.width() - 40 if trash else 40), r.top() + 52)
+            p.rotate(14 if trash else -14)
+            f = self.font()
+            f.setPixelSize(26)
+            f.setWeight(QFont.Black)
+            p.setFont(f)
+            text = "PAPIERKORB" if trash else "BEHALTEN"
+            tw = p.fontMetrics().horizontalAdvance(text) + 24
+            box = QRectF(-tw if trash else 0, -22, tw, 44)
+            p.setPen(QPen(col, 3.5))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(box, 8, 8)
+            p.drawText(box, Qt.AlignCenter, text)
+            p.restore()
+        p.restore()
+
+    def _paint_card(self, p: QPainter, r: QRectF, e: dict, ghost=False):
+        path = QPainterPath()
+        path.addRoundedRect(r, 26, 26)
+        p.fillPath(path, QColor(18, 20, 30, 150 if ghost else 205))
+        paint_glass(p, r, 26, strength=1.3)
+        if ghost:
+            return
+        pv = QRectF(r.left() + 14, r.top() + 14, r.width() - 28, 300)
+        clip = QPainterPath()
+        clip.addRoundedRect(pv, 18, 18)
+        p.fillPath(clip, QColor(0, 0, 0, 70))
+        p.save()
+        p.setClipPath(clip)
+        pix, text = e.get("preview"), e.get("text")
+        if pix:
+            sz = pix.size().scaled(pv.size().toSize(), Qt.KeepAspectRatio)
+            target = QRectF(pv.center().x() - sz.width() / 2, pv.center().y() - sz.height() / 2,
+                            sz.width(), sz.height())
+            p.drawPixmap(target.toRect(), pix)
+        elif text:
+            f = QFont("Consolas")
+            f.setStyleHint(QFont.Monospace)
+            f.setPixelSize(11)
+            p.setFont(f)
+            p.setPen(QColor(255, 255, 255, 200))
+            p.drawText(pv.adjusted(14, 12, -14, -12), Qt.AlignLeft | Qt.AlignTop | Qt.TextWrapAnywhere,
+                       text)
+        else:
+            ic = icon_cache().get(e["path"])
+            p.drawPixmap(QRectF(pv.center().x() - 64, pv.center().y() - 64, 128, 128).toRect(),
+                         ic.pixmap(256, 256))
+        p.restore()
+
+        y = pv.bottom() + 16
+        f = self.font()
+        f.setPixelSize(17)
+        f.setWeight(QFont.Bold)
+        p.setFont(f)
+        p.setPen(Qt.white)
+        name_r = QRectF(r.left() + 22, y, r.width() - 44, 48)
+        name = e["path"].name
+        fm = p.fontMetrics()
+        p.drawText(name_r, Qt.AlignLeft | Qt.AlignTop | Qt.TextWrapAnywhere,
+                   fm.elidedText(name, Qt.ElideMiddle, int(name_r.width() * 1.9)))
+        f.setPixelSize(13)
+        f.setWeight(QFont.Normal)
+        p.setFont(f)
+        p.setPen(TEXT_2)
+        kind = "Ordner" if e["path"].is_dir() else (e["path"].suffix.upper().lstrip(".") or "Datei")
+        lines = [f"{kind}  ·  {human_size(e['size'])}",
+                 "geladen am " + time.strftime("%d.%m.%Y, %H:%M", time.localtime(e["mtime"]))]
+        if e.get("origin"):
+            lines.append(f"von {e['origin']}")
+        p.drawText(QRectF(r.left() + 22, y + 52, r.width() - 44, 80),
+                   Qt.AlignLeft | Qt.AlignTop, "\n".join(lines))
+
+
+class RoundButton(QAbstractButton):
+    def __init__(self, glyph: str, color: str, size=64, tip="", parent=None):
+        super().__init__(parent)
+        self.glyph, self.color, self._hover = glyph, QColor(color), False
+        self.setFixedSize(size, size)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(tip)
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setOpacity(1.0 if self.isEnabled() else 0.35)
+        paint_glass(p, self.rect(), self.width() / 2, strength=2.0, tint=self.color,
+                    hover=self._hover or self.isDown())
+        f = self.font()
+        f.setPixelSize(int(self.width() * 0.42))
+        f.setWeight(QFont.Bold)
+        p.setFont(f)
+        p.setPen(self.color.lighter(150) if self._hover else self.color.lighter(125))
+        p.drawText(self.rect(), Qt.AlignCenter, self.glyph)
+
+
+class CleanerWindow(_Base):
+    """Downloads (oder jeden anderen Ordner) Datei für Datei aufräumen."""
+
+    def __init__(self, mgr: "FenceManager", folder: Path):
+        super().__init__()
+        self.mgr, self.folder = mgr, folder
+        self.decisions: list[tuple[dict, str]] = []     # (Eintrag, "trash"|"keep")
+        self.queue: list[dict] = []
+        self.idx = 0
+        self.committed = False
+        self.setWindowTitle("Downloads aufräumen")
+        self.setWindowIcon(app_icon())
+        if FRAMELESS:
+            self.setTitleBar(TitleBar(self))
+            for b in (self.titleBar.minBtn, self.titleBar.maxBtn, self.titleBar.closeBtn):
+                b.setNormalColor(QColor(255, 255, 255, 200))
+                b.setHoverColor(Qt.white)
+        if ACRYLIC:
+            self.windowEffect.setAcrylicEffect(self.winId(), ACRYLIC_TINT)
+        self._build()
+        self.resize(620, 820)
+        self.load()
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 40 if FRAMELESS else 22, 22, 22)
+        head = QHBoxLayout()
+        titles = QVBoxLayout()
+        titles.setSpacing(2)
+        title = QLabel("Aufräumen")
+        title.setObjectName("h1")
+        self.sub = QLabel("")
+        self.sub.setObjectName("sub")
+        titles.addWidget(title)
+        titles.addWidget(self.sub)
+        head.addLayout(titles)
+        head.addStretch(1)
+        self.b_folder = GlassButton("Ordner …", small=True)
+        self.b_folder.clicked.connect(self.choose_folder)
+        self.b_sort = GlassButton("Älteste zuerst", small=True)
+        self.b_sort.clicked.connect(self.toggle_sort)
+        head.addWidget(self.b_folder)
+        head.addWidget(self.b_sort)
+        root.addLayout(head)
+
+        self.t_again = Toggle("Behaltene erneut zeigen")
+        self.t_again.toggled.connect(lambda _: self.load())
+        root.addWidget(self.t_again)
+
+        self.card = SwipeCard()
+        self.card.decided.connect(self.decide)
+        root.addWidget(self.card, 1)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.b_trash = RoundButton("✕", "#FF453A", 72, "In den Papierkorb  (← / Entf)")
+        self.b_undo = RoundButton("↶", "#FFD60A", 50, "Rückgängig  (Strg+Z)")
+        self.b_open = RoundButton("↗", "#64D2FF", 50, "Öffnen  (Enter)")
+        self.b_keep = RoundButton("✓", "#30D158", 72, "Behalten  (→ / Leertaste)")
+        self.b_trash.clicked.connect(lambda: self.card.fly("trash"))
+        self.b_keep.clicked.connect(lambda: self.card.fly("keep"))
+        self.b_undo.clicked.connect(self.undo)
+        self.b_open.clicked.connect(self.open_current)
+        for b in (self.b_trash, self.b_undo, self.b_open, self.b_keep):
+            row.addWidget(b, 0, Qt.AlignVCenter)
+            row.addSpacing(14)
+        row.addStretch(1)
+        root.addLayout(row)
+        self.b_done = GlassButton("Fertig", primary=True)
+        self.b_done.clicked.connect(self.close)
+        root.addWidget(self.b_done, 0, Qt.AlignHCenter)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        paint_backdrop(p, self.rect(), overlay_only=ACRYLIC)
+
+    # ----- Daten -----
+    def _kept(self) -> dict:
+        return self.mgr.cfg.setdefault("cleaner_keep", {}).setdefault(str(self.folder), {})
+
+    def load(self):
+        kept = {} if self.t_again.isChecked() else self._kept()
+        entries = []
+        try:
+            children = list(self.folder.iterdir())
+        except OSError:
+            children = []
+        for p in children:
+            if p.name.lower() == "desktop.ini" or is_hidden(p) or p.name.endswith(".crdownload"):
+                continue
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            if kept.get(p.name) == int(mtime):
+                continue
+            entries.append({"path": p, "mtime": mtime, "size": None, "origin": None})
+        self.queue = self._sorted(entries)
+        self.idx = 0
+        self.show_current()
+
+    def _sorted(self, entries: list[dict]) -> list[dict]:
+        if self.b_sort.text() == "Größte zuerst":
+            for e in entries:
+                if e["size"] is None:
+                    e["size"] = path_size(e["path"])
+            return sorted(entries, key=lambda e: -e["size"])
+        return sorted(entries, key=lambda e: e["mtime"])
+
+    def toggle_sort(self):
+        self.b_sort.setText("Größte zuerst" if self.b_sort.text() == "Älteste zuerst"
+                            else "Älteste zuerst")
+        self.b_sort.updateGeometry()
+        # Bereits Entschiedenes bleibt, nur der Rest wird neu sortiert
+        self.queue = self.queue[:self.idx] + self._sorted(self.queue[self.idx:])
+        self.show_current()
+
+    def _prepare(self, e: dict | None):
+        if e and "preview" not in e:
+            if e["size"] is None:
+                e["size"] = path_size(e["path"])
+            e["origin"] = download_origin(e["path"])
+            e["preview"], e["text"] = make_preview(e["path"], SwipeCard.CW - 28, 300)
+        return e
+
+    def current(self) -> dict | None:
+        return self.queue[self.idx] if self.idx < len(self.queue) else None
+
+    def show_current(self):
+        cur = self._prepare(self.current())
+        nxt = self._prepare(self.queue[self.idx + 1]) if self.idx + 1 < len(self.queue) else None
+        trash = [d for d, a in self.decisions if a == "trash"]
+        freed = sum(d["size"] or 0 for d in trash)
+        if not cur:
+            kept = sum(1 for _, a in self.decisions if a == "keep")
+            self.card.done_text = (f"Alles erledigt ✨\n\n{len(trash)} in den Papierkorb · "
+                                   f"{kept} behalten\n{human_size(freed)} frei") \
+                if self.decisions else "Hier gibt es nichts aufzuräumen ✨"
+        self.card.set_entry(cur, nxt)
+        left = len(self.queue) - self.idx
+        self.sub.setText(f"{self.folder.name or self.folder}  ·  noch {left}  ·  "
+                         f"{human_size(freed)} frei")
+        self.sub.setToolTip(str(self.folder))
+        for b in (self.b_trash, self.b_keep, self.b_open):
+            b.setEnabled(cur is not None)
+        self.b_undo.setEnabled(bool(self.decisions))
+        self.b_done.setText(f"Fertig – {len(trash)} in den Papierkorb" if trash else "Fertig")
+        self.b_done.updateGeometry()
+
+    # ----- Entscheidungen -----
+    def decide(self, action: str):
+        cur = self.current()
+        if not cur:
+            return
+        self.decisions.append((cur, action))
+        if action == "keep":
+            self._kept()[cur["path"].name] = int(cur["mtime"])
+            self.mgr.write_cfg()
+        self.idx += 1
+        self.show_current()
+
+    def undo(self):
+        if not self.decisions or self.card._busy():
+            return
+        entry, action = self.decisions.pop()
+        if action == "keep":
+            self._kept().pop(entry["path"].name, None)
+            self.mgr.write_cfg()
+        self.idx = max(0, self.idx - 1)
+        self.queue[self.idx] = entry
+        self.show_current()
+
+    def open_current(self):
+        cur = self.current()
+        if cur:
+            self.mgr.launch(str(cur["path"]))
+
+    def choose_folder(self):
+        from PySide6.QtWidgets import QFileDialog
+        folder = QFileDialog.getExistingDirectory(self, "Ordner zum Aufräumen wählen",
+                                                  str(self.folder))
+        if folder:
+            self.commit()
+            self.folder, self.decisions, self.committed = Path(folder), [], False
+            self.load()
+
+    def keyPressEvent(self, e):
+        k = e.key()
+        if k in (Qt.Key_Left, Qt.Key_Delete):
+            self.card.fly("trash")
+        elif k in (Qt.Key_Right, Qt.Key_Space):
+            self.card.fly("keep")
+        elif k in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Up):
+            self.open_current()
+        elif k == Qt.Key_Backspace or (k == Qt.Key_Z and e.modifiers() & Qt.ControlModifier):
+            self.undo()
+        elif k == Qt.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(e)
+
+    # ----- Papierkorb -----
+    def commit(self) -> list[str]:
+        """Alle als „Papierkorb“ markierten Dateien jetzt in den Papierkorb legen
+        (wiederherstellbar). Bis dahin ist jede Entscheidung rückgängig zu machen."""
+        if self.committed:
+            return []
+        self.committed = True
+        failed = []
+        for entry, action in self.decisions:
+            if action == "trash" and entry["path"].exists():
+                if not QFile.moveToTrash(str(entry["path"])):
+                    failed.append(entry["path"].name)
+        return failed
+
+    def closeEvent(self, e):
+        n = sum(1 for _, a in self.decisions if a == "trash")
+        failed = self.commit()
+        if failed:
+            QMessageBox.warning(self, "Papierkorb",
+                                "Nicht in den Papierkorb verschoben (in Benutzung?):\n\n"
+                                + "\n".join(failed))
+        elif n:
+            self.mgr.notify.emit("Aufgeräumt", f"{n} Datei(en) im Papierkorb")
+        super().closeEvent(e)
 
 
 STYLE = """
@@ -3091,6 +3627,14 @@ def run_app(app: QApplication, args) -> None:
     fences = FenceManager(args.storage, args.rules, args.memory)
     fences.sync()
     app.aboutToQuit.connect(fences.hook.stop)
+    # Offene Aufräum-Entscheidungen beim Beenden noch ausführen
+    app.aboutToQuit.connect(lambda: getattr(fences, "_cleaner", None)
+                            and fences._cleaner.isVisible() and fences._cleaner.close())
+    # Autostart: Verknüpfung bei jedem Start (neu) anlegen – zeigt so auch nach
+    # dem Verschieben der .pyw oder einer neuen Python-Umgebung auf die richtige Stelle.
+    if Win32.ok and fences.settings["autostart"]:
+        import threading
+        threading.Thread(target=set_autostart, args=(True,), daemon=True).start()
     state = {"win": None}
 
     def open_manager():
