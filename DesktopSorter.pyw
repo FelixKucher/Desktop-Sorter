@@ -601,6 +601,39 @@ except ImportError:
     _fatal("PySide6 fehlt. Einmalig in PowerShell ausführen:\n\n"
            "py -m pip install PySide6 PySideSix-Frameless-Window anthropic")
 
+
+def _isolate_qt() -> None:
+    """Qt auf die Plugins von PySide6 festnageln. Andere Programme mit eigener
+    Qt-Version setzen oft QT_PLUGIN_PATH oder legen Qt-DLLs in den PATH; Qt lädt
+    dann fremde Plugins und bricht mit „no Qt platform plugin could be
+    initialized“ ab."""
+    base = Path(PySide6.__file__).resolve().parent
+    plugins = next((p for p in (base / "plugins", base / "Qt" / "plugins")
+                    if (p / "platforms").is_dir()), None)
+    reinstall = ("\n\nIn der Umgebung, mit der du das Programm startest, ausführen:\n\n"
+                 "python -m pip install --force-reinstall PySide6 PySide6_Essentials "
+                 "PySide6_Addons shiboken6")
+    if plugins is None or (os.name == "nt" and
+                           not (plugins / "platforms" / "qwindows.dll").exists()):
+        _fatal(f"PySide6 ist unvollständig installiert (Qt-Plattform-Plugin fehlt in "
+               f"{base})." + reinstall)
+    os.environ["QT_PLUGIN_PATH"] = str(plugins)
+    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(plugins / "platforms")
+    if os.name == "nt":                 # fremde Qt-DLL-Ordner aus dem PATH nehmen
+        def foreign_qt(d: str) -> bool:
+            try:
+                p = Path(d)
+                return p.resolve() != base and any(
+                    (p / dll).exists() for dll in ("Qt6Core.dll", "Qt5Core.dll"))
+            except (OSError, ValueError):
+                return False
+        parts = [d for d in os.environ.get("PATH", "").split(os.pathsep)
+                 if d and not foreign_qt(d)]
+        os.environ["PATH"] = os.pathsep.join([str(base)] + parts)
+
+
+_isolate_qt()
+
 from PySide6.QtCore import (QFileInfo, QMimeData, QPoint, QPointF, QRectF, QSize, Qt,
                             QThread, QTimer, QUrl, Signal)
 from PySide6.QtGui import (QBrush, QColor, QDesktopServices, QDrag, QFont, QIcon,
