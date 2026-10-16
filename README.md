@@ -8,7 +8,7 @@ Sortiert die Symbole auf dem Windows-Desktop thematisch in Gruppenordner – nac
 
 ## Installation
 
-Voraussetzung: Windows 10/11, Python ≥ 3.11.
+Voraussetzung: Windows 10/11, Python ≥ 3.9.
 
 ```powershell
 py -m pip install -r requirements.txt

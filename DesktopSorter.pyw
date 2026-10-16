@@ -36,9 +36,16 @@ import shutil
 import subprocess
 import sys
 import time
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+
+try:                        # Python ≥ 3.11
+    import tomllib
+except ModuleNotFoundError:
+    try:                    # gleiche API als Paket: pip install tomli
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        tomllib = None      # → eingebauter Leser für regeln.toml
 
 JOURNAL_DIR = Path.home() / ".desktop_sorter"
 DEFAULT_RULES = Path(__file__).with_name("regeln.toml")
@@ -245,11 +252,27 @@ def scan(user: Path, public: Path, skip_names: set[str]) -> list[Item]:
     return items
 
 
+def _parse_rules_toml(text: str) -> dict[str, list[str]]:
+    """Minimaler Leser für das Format von regeln.toml (Abschnitt [regeln] mit
+    "Name" = ["…", "…"], auch mehrzeilig) — Fallback ohne tomllib/tomli."""
+    def unescape(s: str) -> str:
+        return re.sub(r'\\(["\\])', r"\1", s)
+
+    text = re.sub(r"(?m)^\s*#.*$", "", text)
+    m = re.search(r"(?ms)^\s*\[regeln\]\s*$(.*?)(?=^\s*\[|\Z)", text)
+    if not m:
+        return {}
+    str_rx = r'"((?:[^"\\]|\\.)*)"'
+    return {unescape(k): [unescape(v) for v in re.findall(str_rx, body)]
+            for k, body in re.findall(str_rx + r"\s*=\s*\[(.*?)\]", m.group(1), re.S)}
+
+
 def load_rules(path: Path | None) -> list[tuple[str, re.Pattern]]:
     if not path or not path.exists():
         return []
-    data = tomllib.loads(path.read_text(encoding="utf-8")).get("regeln", {})
-    return [(cat, re.compile("|".join(p), re.I)) for cat, p in data.items()]
+    text = path.read_text(encoding="utf-8")
+    data = (tomllib.loads(text) if tomllib else {"regeln": _parse_rules_toml(text)}).get("regeln", {})
+    return [(cat, re.compile("|".join(p), re.I)) for cat, p in data.items() if p]
 
 
 # Gedächtnis aus den Rückfragen: neue Gruppen, Entscheidungen pro Datei
