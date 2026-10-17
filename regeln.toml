@@ -1,6 +1,0 @@
-# Eigene Themen — haben Vorrang vor allen eingebauten Regeln.
-# Schlüssel = Ordnername, Werte = Regex-Fragmente (Groß/Klein egal) auf den Anzeigenamen.
-
-[regeln]
-"Hausplanung" = ["obergeschoss", "erdgeschoss", "grundriss", "^fbh\\b", "loopcad",
-                 "roomsketcher", "sweet home", "hauszeug"]
