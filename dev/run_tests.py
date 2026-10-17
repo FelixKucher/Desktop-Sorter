@@ -1,4 +1,4 @@
-"""Alle Tests: Engine-Module (dev/organizer/test_*.py), App-Ende-zu-Ende-Test und die
+"""Alle Tests: Engine-Module (dev/organizer/test_*.py), App-Ende-zu-Ende-Tests und die
 Prüfung, ob DesktopSorter.pyw zu den Quellen passt.
 
     python dev/run_tests.py            # alles
@@ -32,8 +32,8 @@ def main():
         ok &= run([py, t.name], DEV / "organizer", t.name)
     if "--quick" not in sys.argv:
         print("App-Test:")
-        ok &= run([py, str(DEV / "tests" / "test_app_organizer.py")], DEV.parent,
-                  "test_app_organizer.py")
+        for t in sorted((DEV / "tests").glob("test_app_*.py")):
+            ok &= run([py, str(t)], DEV.parent, t.name)
     print("\nALLE TESTS BESTANDEN" if ok else "\nES GIBT FEHLER")
     sys.exit(0 if ok else 1)
 

@@ -16,10 +16,16 @@ Journal für „Rückgängig“: %USERPROFILE%\\.desktop_sorter
 Bedienung
   • Gruppen erscheinen als Glaskarten. Rechts „Auf dem Desktop“: was liegen
     bleibt; orange „?“ = unklar.
-  • Objekte per Drag & Drop auf eine Karte, auf „+ Neue Gruppe“ oder zurück
-    nach rechts ziehen. Rechtsklick für alle Optionen, Doppelklick = Vorschlag.
-  • „Sortieren“ verschiebt erst nach Bestätigung; „Rückgängig“ macht es komplett
-    rückgängig. „Mit Claude sortieren“ ordnet Unklares per KI zu (API-Schlüssel).
+  • Objekte per Drag & Drop auf eine Karte, auf „+ Neue Gruppe“, auf „Papierkorb“
+    oder zurück nach rechts ziehen. Rechtsklick für alle Optionen, Doppelklick =
+    Vorschlag. Bestehende Boxen (▣) sind immer als Karte da.
+  • Unterordner werden mit einsortiert; Programm-, Spiel- und Projektordner (⚙)
+    bleiben liegen, damit sie weiter funktionieren.
+  • „In Boxen sortieren“ verschiebt erst nach Bestätigung; „Rückgängig“ macht es
+    komplett rückgängig. „Mit Claude“ (API-Schlüssel) und „Online nachschlagen“
+    (Wikidata/Wikipedia, nach Zustimmung) ordnen Unklares zu.
+  • Die Leiste darunter erreicht alles Weitere: Ordner-Assistent, Downloads
+    aufräumen, Papierkorb, neue Box, Boxen anordnen/ausblenden, Einstellungen.
 """
 from __future__ import annotations
 
@@ -83,7 +89,7 @@ KNOWN_APPS: list[tuple[str, str]] = [
      r"msi center|nvidia|amd software|deskjet|hp smart|zubehör|drucker|scanner"),
     ("3D-Druck & CAD",
      r"fusion|autocad|freecad|blender|orca ?slicer|prusa|cura|bambu|loopcad|"
-     r"roomsketcher|sweet home|sketchup|solidworks|kicad|^printer\.cfg$|klipper"),
+     r"roomsketcher|sweet home|sketchup|solidworks|kicad|^printer(\.cfg)?$|klipper"),
     ("Entwicklung",
      r"pycharm|visual studio|vs ?code|\bcode\.exe|eclipse|intellij|github|\bgit\b|"
      r"unity|unreal|virtualbox|vmware|docker|wsl|postman|anaconda|jupyter|"
@@ -113,6 +119,10 @@ GAME_TARGET = re.compile(
     r"steamapps|\\epic games\\|\\ea games\\|\\riot games\\|\\gog galaxy\\games|"
     r"ubisoft game launcher\\games|\\rockstar games\\|\\xboxgames\\|\\games\\|"
     r"^steam://rungameid|^com\.epicgames\.launcher://|^uplay://|^battlenet://", re.I)
+
+# Kategorien des Ordner-Assistenten → Desktop-Gruppe (Rest: „Büro & Dokumente“)
+DOC_GROUPS = {"invoice": "Finanzen", "bank": "Finanzen", "tax": "Finanzen",
+              "payslip": "Finanzen", "insurance": "Finanzen"}
 
 KEYWORDS: list[tuple[str, str]] = [
     ("Finanzen", r"rechnung|invoice|quittung|beleg|kontoauszug|steuer|elster|lohn|"
@@ -224,6 +234,7 @@ class Item:
     category: str = "Sonstiges"
     reason: str = "keine Regel"
     confidence: str = "low"
+    role: str = ""                # Ordner: program | project | content | empty
 
     @property
     def label(self) -> str:       # wie auf dem Desktop angezeigt
@@ -285,23 +296,43 @@ class Memory:
         self.groups: list[str] = d.get("gruppen", [])
         self.files: dict[str, str] = d.get("dateien", {})
         self.keywords: dict[str, list[str]] = d.get("regeln", {})
+        self.aliases: dict[str, str] = d.get("umbenannt", {})   # umbenannte Boxen: alt → neu
 
     def rules(self) -> list[tuple[str, re.Pattern]]:
         return [(c, re.compile("|".join(map(re.escape, kws)), re.I))
                 for c, kws in self.keywords.items() if kws]
 
+    def alias(self, cat: str) -> str:
+        seen = {"Sonstiges"}                        # „Sonstiges“ = bleibt liegen, nie umleiten
+        while cat in self.aliases and cat not in seen:
+            seen.add(cat)
+            cat = self.aliases[cat]
+        return cat
+
+    def renamed(self, old: str, new: str) -> None:
+        """Box umbenannt: Entscheidungen, Regeln und künftige Zuordnungen folgen."""
+        self.aliases = {k: (new if v == old else v) for k, v in self.aliases.items()}
+        self.aliases[old] = new
+        self.aliases.pop(new, None)
+        self.files = {k: (new if v == old else v) for k, v in self.files.items()}
+        if old in self.keywords:
+            self.keywords.setdefault(new, []).extend(self.keywords.pop(old))
+        self.groups = [new if x == old else x for x in self.groups]
+
     def save(self) -> None:
-        self.path.write_text(json.dumps({"gruppen": self.groups, "dateien": self.files,
-                                         "regeln": self.keywords},
-                                        indent=2, ensure_ascii=False), encoding="utf-8")
+        data = {"gruppen": self.groups, "dateien": self.files, "regeln": self.keywords}
+        if self.aliases:
+            data["umbenannt"] = self.aliases
+        self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def classify(it: Item, rules, memory: Memory | None = None) -> None:
     def hit(cat, why, conf="high"):
-        it.category, it.reason, it.confidence = cat, why, conf
+        it.category, it.reason, it.confidence = (memory.alias(cat) if memory else cat), why, conf
 
     exe = Path(it.target.split(" -")[0]).name.lower() if it.kind == "lnk" else ""
-    hay = f"{it.label} {exe}".strip().lower()
+    # Dateien: ohne Endung vergleichen – sonst wird jede „….pdf“ zur „bekannten App“
+    hay = f"{it.path.stem if it.kind == 'file' else it.label} {exe}".strip().lower()
 
     if memory and it.path.name in memory.files:
         cat = memory.files[it.path.name]
@@ -310,6 +341,10 @@ def classify(it: Item, rules, memory: Memory | None = None) -> None:
     for cat, rx in rules:
         if m := rx.search(it.label):
             return hit(cat, f"eigene Regel '{m.group(0)}'")
+    if it.kind == "file":                      # Dokumente: Thema vor App-Namen
+        for cat, pat in KEYWORDS:
+            if m := re.search(pat, it.label, re.I):
+                return hit(cat, f"Stichwort '{m.group(0)}'")
     for cat, pat in KNOWN_APPS:
         if m := re.search(pat, hay, re.I):
             return hit(cat, f"bekannte App '{m.group(0).strip()}'")
@@ -318,10 +353,389 @@ def classify(it: Item, rules, memory: Memory | None = None) -> None:
     for cat, pat in KEYWORDS:
         if m := re.search(pat, it.label, re.I):
             return hit(cat, f"Stichwort '{m.group(0)}'")
+    if it.kind == "file":                      # zweisprachiges Dokument-Lexikon
+        doc = org_classify_document(it.path.name, "", org_kind(it.path))[0]
+        if doc and doc != "document":
+            return hit(DOC_GROUPS.get(doc, "Büro & Dokumente"),
+                       f"Dokument: {ORG_CATEGORIES[doc]['label']}", "medium")
     ext = it.path.suffix.lower().lstrip(".")
     if it.kind == "file" and ext in EXTENSIONS:
         return hit(EXTENSIONS[ext], f"Dateityp .{ext}", "low")
     hit("Sonstiges", "keine Regel", "low")
+
+
+# --------------------------------------------------------------------------- #
+# Unterordner: Programm/Projekt (bleibt liegen) oder Inhalt (wird einsortiert)
+# --------------------------------------------------------------------------- #
+PROGRAM_EXTS = {".exe", ".dll", ".pak", ".jar", ".msi", ".sys", ".ocx", ".asar"}
+PROGRAM_MARKERS = {".build.info", "steam_appid.txt", "unityplayer.dll", "unins000.exe",
+                   "uninstall.exe", "uninst.exe", "launcher.exe", "gameoverlayrenderer64.dll",
+                   "eosoverlayrenderer-win64-shipping.exe", "engine", "_commonredist"}
+FOLDER_CONTENT_GROUPS = {"image": "Bilder & Grafik", "video": "Musik & Video",
+                         "audio": "Musik & Video", "document": "Büro & Dokumente",
+                         "cad": "3D-Druck & CAD", "code": "Entwicklung", "archive": "Archive",
+                         "installer": "System & Datenträger", "science": "Büro & Dokumente"}
+FOLDER_SCAN_LIMIT = 1500         # so viele Einträge je Ordner höchstens ansehen
+
+
+def installed_locations(reg=None) -> set[str]:
+    """InstallLocation aller in Windows eingetragenen Programme (normalisiert)."""
+    if reg is None:
+        if os.name != "nt":
+            return set()
+        import winreg as reg
+    out = set()
+    roots = [(reg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+             (reg.HKEY_LOCAL_MACHINE, r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+             (reg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall")]
+    for hive, key in roots:
+        try:
+            with reg.OpenKey(hive, key) as k:
+                i = 0
+                while True:
+                    try:
+                        sub = reg.EnumKey(k, i)
+                    except OSError:
+                        break
+                    i += 1
+                    try:
+                        with reg.OpenKey(k, sub) as sk:
+                            loc = str(reg.QueryValueEx(sk, "InstallLocation")[0]).strip().strip('"')
+                    except OSError:
+                        continue
+                    if len(loc) > 3:
+                        out.add(os.path.normcase(os.path.normpath(loc)))
+        except OSError:
+            continue
+    return out
+
+
+def folder_role(path: Path, install_dirs: set[str] = frozenset()) -> tuple[str, str]:
+    """(Rolle, Begründung). „program“/„project“ bleiben liegen, damit sie funktionieren."""
+    norm = os.path.normcase(os.path.normpath(str(path)))
+    if norm in install_dirs or any(d.startswith(norm + os.sep) for d in install_dirs):
+        return "program", "Programmordner – in Windows als installiertes Programm eingetragen"
+    try:
+        if org_is_project_dir(path):
+            return "project", "Projektordner (Code/Versionsverwaltung) – bleibt liegen"
+    except Exception:                                   # noqa: BLE001
+        pass
+    seen, exe = 0, None
+    stack = [(path, 0)]
+    while stack and seen < FOLDER_SCAN_LIMIT:
+        d, depth = stack.pop()
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for e in entries:
+            seen += 1
+            n = e.name.lower()
+            try:
+                is_dir = e.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if n in PROGRAM_MARKERS and depth <= 1:
+                return "program", f"Programm- oder Spielordner (enthält {e.name}) – bleibt liegen"
+            if depth >= 1 and (n in ORG_PROJECT_STRONG or n.endswith((".sln", ".csproj", ".vcxproj"))):
+                return "project", f"enthält Code-Projekte ({Path(d).name}) – bleibt liegen"
+            if not is_dir:
+                ext = os.path.splitext(n)[1]
+                if ext == ".ino":
+                    return "project", f"Arduino-Sketch ({e.name}) – bleibt liegen"
+                if ext in PROGRAM_EXTS and depth <= 2:
+                    exe = exe or e.name
+            elif depth < 2 and not n.startswith("."):
+                stack.append((Path(e.path), depth + 1))
+    if exe:
+        return "program", f"Programm- oder Spielordner (enthält {exe}) – bleibt liegen"
+    return ("content" if seen else "empty"), ""
+
+
+def folder_content_group(path: Path) -> tuple[str, float, int]:
+    """Häufigste Dateiart im Ordner → (Gruppe, Anteil, Anzahl Dateien)."""
+    counts: dict[str, int] = {}
+    total = 0
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fn in files:
+            if fn.lower() in ("desktop.ini", "thumbs.db"):
+                continue
+            k = org_kind(Path(fn))
+            counts[k] = counts.get(k, 0) + 1
+            total += 1
+            if total >= FOLDER_SCAN_LIMIT:
+                break
+        if total >= FOLDER_SCAN_LIMIT:
+            break
+    if not total:
+        return "", 0.0, 0
+    kind, n = max(counts.items(), key=lambda kv: kv[1])
+    return FOLDER_CONTENT_GROUPS.get(kind, ""), n / total, total
+
+
+def classify_folder(it: Item, install_dirs: set[str] = frozenset()) -> None:
+    """Unterordner einordnen. Programm-/Projektordner bleiben liegen; eigene
+    Entscheidungen (aus dem Gedächtnis) haben Vorrang."""
+    if it.kind != "folder":
+        return
+    role, why = folder_role(it.path, install_dirs)
+    it.role = role
+    if it.confidence in ("user", "keep"):
+        return
+    if role in ("program", "project"):
+        it.category, it.reason, it.confidence = "Sonstiges", why, "keep"
+        return
+    if it.confidence == "high":                         # Name eindeutig (Regel/Stichwort)
+        return
+    cat, _score, _terms, _year = org_classify_document(it.label, "", "document")
+    if cat:
+        it.category, it.confidence = DOC_GROUPS.get(cat, "Büro & Dokumente"), "medium"
+        it.reason = f"Ordnername: {ORG_CATEGORIES[cat]['label']}"
+        return
+    group, share, n = folder_content_group(it.path)
+    if group and share >= 0.6:
+        it.category, it.confidence = group, "medium"
+        it.reason = f"Inhalt: {round(share * 100)} % {group} ({n} Dateien)"
+    elif role == "empty":
+        it.reason = "leerer Ordner"
+
+
+def folder_has_binaries(path: Path, limit: int = 5000) -> str:
+    """Tiefe Suche nach Programmdateien (für Ordner, die online als Software gelten)."""
+    seen = 0
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fn in files:
+            seen += 1
+            if os.path.splitext(fn)[1].lower() in PROGRAM_EXTS:
+                return fn
+        if seen >= limit:
+            break
+    return ""
+
+
+# --------------------------------------------------------------------------- #
+# Online nachschlagen (Wikidata / Wikipedia, ohne Schlüssel) – nur auf Wunsch
+# --------------------------------------------------------------------------- #
+ONLINE_UA = "DesktopSorter/1.0 (https://github.com/FelixKucher/Desktop-Sorter)"
+ONLINE_CACHE = JOURNAL_DIR / "online_cache.json"
+ONLINE_MAX = 40                  # höchstens so viele Namen pro Durchgang
+ONLINE_PAUSE = 0.5               # Sekunden zwischen Anfragen (Wikimedia-Rate-Limit)
+ONLINE_RULES: list[tuple[str, str]] = [
+    ("Spiele-Launcher & Tools", r"spieleplattform|vertriebsplattform|distribution platform|"
+                                r"digital distribution|game launcher|launcher|mod manager|"
+                                r"game client|modding"),
+    ("Entwicklung", r"entwicklungsumgebung|\bide\b|quelltext-?editor|source[- ]code editor|"
+                    r"code editor|programmiersprache|programming language|compiler|"
+                    r"versionsverwaltung|version control|software development|"
+                    r"softwareentwicklung|hard- und softwareplattform|mikrocontroller|"
+                    r"microcontroller|open hardware|open-source hardware|electronics platform|"
+                    r"virtualisierung|virtual machine|hypervisor|\bsdk\b|framework|"
+                    r"spiel-?engine|game engine"),
+    ("Spiele", r"computerspiel|videospiel|\bspiel\b|video ?game|\bgame\b|mmorpg|rollenspiel|"
+               r"shooter|strategiespiel|battle royale|simulationsspiel|downloadable content|"
+               r"game expansion|erweiterung .*spiel"),
+    ("3D-Druck & CAD", r"\bcad\b|slicer|3d-druck|3d printing|3d-modell|3d model|"
+                       r"computer-aided design|rechnergestützt"),
+    ("Kommunikation", r"messenger|instant messaging|\bvoip\b|\bchat|videokonferenz|"
+                      r"video conferenc|e-mail-programm|email client|e-mail client"),
+    ("Browser & Internet", r"webbrowser|web browser|\bbrowser\b|\bftp\b|\bvpn\b|"
+                           r"download-?manager|passwort-?manager|password manager"),
+    ("Büro & Dokumente", r"office|textverarbeitung|word processor|tabellenkalkulation|"
+                         r"spreadsheet|\bpdf\b|präsentationsprogramm|presentation program|"
+                         r"notiz|note-taking"),
+    ("Bilder & Grafik", r"bildbearbeitung|image editor|raster graphics|grafiksoftware|"
+                        r"vektorgrafik|vector graphics|fotobearbeitung|photo editing"),
+    ("Musik & Video", r"mediaplayer|media player|musik-?streaming|music streaming|"
+                      r"videobearbeitung|video editing|audio editor|streaming"),
+    ("Hardware & Peripherie", r"treiber|\bdriver|peripher|\brgb\b|mainboard|motherboard|"
+                              r"\bmaus\b|\bmouse\b|tastatur|keyboard|drucker|printer|"
+                              r"grafikkarte|graphics card"),
+    ("System & Datenträger", r"dienstprogramm|utility|antivir|backup|partition|"
+                             r"disk imag|datenträger|betriebssystem|operating system|"
+                             r"systemprogramm|system software"),
+]
+
+
+def online_clean_name(name: str) -> str:
+    """„arduino-1.8.19-windows“ → „arduino“; „Diablo III (x86)“ → „Diablo III“.
+    Leer, wenn nichts Nachschlagbares übrig bleibt (z. B. „ZS_7805 052 430“)."""
+    s = re.sub(r"\.(lnk|url|exe|zip)$", "", name, flags=re.I)
+    s = re.sub(r"\(.*?\)|\[.*?\]", " ", s)
+    s = re.sub(r"[_\-.]+", " ", s)
+    s = re.sub(r"\b(v?\d+(\s\d+)*|x64|x86|win(32|64)?|windows|setup|installer|portable|"
+               r"launcher|client|full|final|neu|new|kopie|copy)\b", " ", s, flags=re.I)
+    s = re.sub(r"\s+", " ", s).strip()
+    letters = sum(ch.isalpha() for ch in s)
+    return s if letters >= 3 and letters >= len(s.replace(" ", "")) * 0.6 else ""
+
+
+def online_category(text: str) -> str:
+    t = text.lower()
+    for cat, pat in ONLINE_RULES:
+        if re.search(pat, t):
+            return cat
+    return ""
+
+
+def _online_fetch(url: str) -> dict:
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": ONLINE_UA})
+    with urllib.request.urlopen(req, timeout=8) as r:   # noqa: S310 — feste https-URLs
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+class OnlineRateLimited(Exception):
+    pass
+
+
+class OnlineUnavailable(Exception):
+    """Keine einzige Anfrage kam durch (offline, Proxy, Firewall)."""
+
+
+def online_lookup(name: str, fetch=None) -> dict:
+    """Was ist „name“? → {"query", "label", "description", "category", "source"}.
+    Wikidata (de, dann en), sonst Wikipedia-Suche. Wirft OnlineRateLimited bei HTTP 429
+    und OnlineUnavailable, wenn keine Anfrage durchkam."""
+    from urllib.error import HTTPError, URLError
+    from urllib.parse import quote
+    fetch = fetch or _online_fetch
+    q = online_clean_name(name)
+    res = {"query": q, "label": "", "description": "", "category": "", "source": ""}
+    if not q:
+        return res
+    norm = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
+
+    def similar(label: str) -> bool:
+        a, b = norm(label), norm(q)
+        return bool(a and b) and (a == b or a.startswith(b) or b.startswith(a))
+
+    urls = [("Wikidata", lang, "https://www.wikidata.org/w/api.php?action=wbsearchentities"
+             f"&search={quote(q)}&language={lang}&uselang={lang}&format=json&limit=5")
+            for lang in ("de", "en")]
+    urls += [("Wikipedia", lang, f"https://{lang}.wikipedia.org/w/api.php?action=query"
+              f"&list=search&srsearch={quote(q)}&srlimit=3&format=json&srprop=snippet")
+             for lang in ("de", "en")]
+    answered = False
+    for source, lang, url in urls:
+        try:
+            data = fetch(url)
+        except HTTPError as e:
+            if e.code == 429:
+                raise OnlineRateLimited() from e
+            answered = True                             # Server erreichbar, nur Fehler
+            continue
+        except (URLError, OSError, ValueError):
+            continue
+        answered = True
+        if source == "Wikidata":
+            hits = [(h.get("label", ""), h.get("description", ""))
+                    for h in data.get("search", [])]
+        else:
+            hits = [(h.get("title", ""), re.sub(r"<[^>]+>", "", h.get("snippet", "")))
+                    for h in data.get("query", {}).get("search", [])]
+        for label, desc in hits:
+            if desc and similar(label):
+                res.update(label=label, description=desc, source=f"{source} ({lang})",
+                           category=online_category(f"{label} {desc}"))
+                if res["category"]:
+                    return res
+        if res["description"]:
+            return res
+        time.sleep(ONLINE_PAUSE)
+    if not answered:
+        raise OnlineUnavailable()
+    return res
+
+
+ONLINE_CACHE_DAYS = 90
+ONLINE_LEAVE = ("program", "project")
+
+
+def online_candidates(items: list[Item]) -> list[Item]:
+    """Was nachgeschlagen wird: unklare Ordner und Verknüpfungen zuerst, danach
+    Programmordner (nur zur Info). Dateien nie – deren Namen sind oft persönlich."""
+    unclear = [it for it in items if it.kind in ("folder", "lnk", "url")
+               and it.confidence == "low" and it.role not in ONLINE_LEAVE]
+    progs = [it for it in items if it.kind == "folder" and it.role in ONLINE_LEAVE
+             and "Online:" not in it.reason]
+    return [it for it in unclear + progs if online_clean_name(it.label)][:ONLINE_MAX]
+
+
+def online_resolve(items: list[Item], cache: dict, fetch=None, progress=None,
+                   stop=lambda: False, pause: float = ONLINE_PAUSE) -> tuple[dict, str]:
+    """Namen nachschlagen (Cache zuerst). → ({Pfad: Ergebnis}, Abbruchgrund "" |
+    "limit" | "offline"). Ordner mit Software-Treffer werden auf Programmdateien geprüft."""
+    out, why, asked = {}, "", 0
+    for n, it in enumerate(items, 1):
+        if stop():
+            break
+        q = online_clean_name(it.label).lower()
+        hit = cache.get(q)
+        if hit and time.time() - hit.get("t", 0) < ONLINE_CACHE_DAYS * 86400:
+            res = hit
+        elif why:
+            continue
+        else:
+            if asked:
+                time.sleep(pause)
+            try:
+                res = online_lookup(it.label, fetch)
+            except OnlineRateLimited:
+                why = "limit"
+                continue
+            except OnlineUnavailable:
+                why = "offline"
+                break
+            asked += 1
+            res["t"] = time.time()
+            cache[q] = res
+        if it.kind == "folder" and res.get("category"):
+            res = dict(res, binaries=folder_has_binaries(it.path))
+        out[str(it.path)] = res
+        if progress:
+            progress(n, len(items), it.label)
+    return out, why
+
+
+def apply_online(it: Item, res: dict, alias=None) -> bool:
+    """Ergebnis übernehmen. True = Zuordnung geändert. Programm-/Projektordner und
+    eigene Entscheidungen bekommen nur die Info dazu."""
+    if not res or not res.get("description"):
+        return False
+    info = f"Online: {res['label']} – {res['description']}"
+    if it.role in ONLINE_LEAVE or it.confidence in ("user", "keep"):
+        if "Online:" not in it.reason:
+            it.reason = f"{it.reason} · {info}"
+        return False
+    if it.kind == "folder" and res.get("category") and res.get("binaries"):
+        it.role, it.category, it.confidence = "program", "Sonstiges", "keep"
+        it.reason = f"Programmordner (enthält {res['binaries']}) – bleibt liegen · {info}"
+        return True
+    if res.get("category"):
+        it.category = alias(res["category"]) if alias else res["category"]
+        it.confidence = "medium"
+        it.reason = f"{info} ({res['source']})"
+        return True
+    it.reason = info
+    return False
+
+
+def online_cache_load() -> dict:
+    try:
+        data = json.loads(ONLINE_CACHE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def online_cache_save(cache: dict) -> None:
+    try:
+        ONLINE_CACHE.parent.mkdir(exist_ok=True)
+        ONLINE_CACHE.write_text(json.dumps(cache, indent=1, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _anon(s: str) -> str:
@@ -330,7 +744,8 @@ def _anon(s: str) -> str:
     return re.sub(re.escape(home), "%USERPROFILE%", s, flags=re.I) if s else s
 
 
-def classify_with_claude(items: list[Item], all_items: list[Item], model: str) -> None:
+def classify_with_claude(items: list[Item], all_items: list[Item], model: str,
+                         extra_groups: list[str] | None = None) -> None:
     """Semantische Gruppierung. Gesendet werden nur Anzeigename, Typ und Ziel
     (Benutzerpfad maskiert) — keine Dateiinhalte."""
     try:
@@ -356,8 +771,12 @@ def classify_with_claude(items: list[Item], all_items: list[Item], model: str) -
     }
     prompt = f"""Gruppiere Windows-Desktop-Objekte thematisch, wie die iOS-App-Mediathek.
 
-Standardkategorien (bevorzugt verwenden, exakt so schreiben):
-{json.dumps(CATEGORIES, ensure_ascii=False)}
+Standardkategorien (bevorzugt verwenden, exakt so schreiben; die ersten sind die schon
+vorhandenen Boxen des Nutzers und haben Vorrang):
+{json.dumps(list(dict.fromkeys(list(extra_groups or []) + CATEGORIES)), ensure_ascii=False)}
+
+Ordner (typ "folder") nur einordnen, wenn sie Inhalte enthalten (Fotos, Dokumente …);
+Programm- oder Spielordner gehören nicht dazu.
 
 Regeln:
 - Thema schlägt Dateityp: eine PDF-Rechnung gehört zu "Finanzen", nicht "Büro & Dokumente".
@@ -8697,8 +9116,8 @@ def letter_icon(name: str, size=128) -> QIcon:
     return QIcon(pm)
 
 
-def badge_icon(icon: QIcon, size=96) -> QIcon:
-    """Orangener „?“-Punkt für unklare Objekte."""
+def badge_icon(icon: QIcon, size=96, text="?", color: QColor | None = None) -> QIcon:
+    """Punkt oben rechts: orange „?“ = unklar, „⚙“ = Programm-/Projektordner."""
     pm = icon.pixmap(size, size)
     out = QPixmap(size, size)
     out.fill(Qt.transparent)
@@ -8707,7 +9126,7 @@ def badge_icon(icon: QIcon, size=96) -> QIcon:
     p.drawPixmap(0, 0, pm.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
     d = size * 0.38
     r = QRectF(size - d - 1, 1, d, d)
-    p.setBrush(WARN)
+    p.setBrush(color or WARN)
     p.setPen(QPen(QColor(255, 255, 255, 220), 2))
     p.drawEllipse(r)
     f = QFont()
@@ -8715,7 +9134,19 @@ def badge_icon(icon: QIcon, size=96) -> QIcon:
     f.setBold(True)
     p.setFont(f)
     p.setPen(Qt.white)
-    p.drawText(r, Qt.AlignCenter, "?")
+    p.drawText(r, Qt.AlignCenter, text)
+    p.end()
+    return QIcon(out)
+
+
+def faded_icon(icon: QIcon, size=96, opacity=0.45) -> QIcon:
+    """Blasses Symbol – „liegt schon in der Box“."""
+    out = QPixmap(size, size)
+    out.fill(Qt.transparent)
+    p = QPainter(out)
+    p.setOpacity(opacity)
+    p.drawPixmap(0, 0, icon.pixmap(size, size).scaled(size, size, Qt.KeepAspectRatio,
+                                                      Qt.SmoothTransformation))
     p.end()
     return QIcon(out)
 
@@ -8844,7 +9275,10 @@ def decode_ids(md: QMimeData) -> list[int]:
 class ItemList(QListWidget):
     dropped = Signal(list)
     menuRequested = Signal(list, QPoint)
+    pathMenuRequested = Signal(str, QPoint)      # Eintrag einer bestehenden Box
+    deleteRequested = Signal(list)
     activated_ = Signal(int)
+    pathActivated = Signal(str)
 
     def __init__(self, icon=52, cell=110, parent=None):
         super().__init__(parent)
@@ -8865,7 +9299,9 @@ class ItemList(QListWidget):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._menu)
-        self.itemDoubleClicked.connect(lambda it: self.activated_.emit(it.data(Qt.UserRole)))
+        self.itemDoubleClicked.connect(
+            lambda it: self.pathActivated.emit(it.data(Qt.UserRole + 1))
+            if it.data(Qt.UserRole) == -1 else self.activated_.emit(it.data(Qt.UserRole)))
 
     def ids(self, items) -> list[int]:
         return [i.data(Qt.UserRole) for i in items]
@@ -8892,9 +9328,19 @@ class ItemList(QListWidget):
         e.acceptProposedAction()
         self.dropped.emit(ids)
 
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Delete and self.selectedItems():
+            self.deleteRequested.emit(self.ids(self.selectedItems()))
+        else:
+            super().keyPressEvent(e)
+
     def _menu(self, pos):
         items = self.selectedItems()
         under = self.itemAt(pos)
+        if under and under.data(Qt.UserRole) == -1:    # Box-Inhalt: eigenes Menü
+            self.pathMenuRequested.emit(under.data(Qt.UserRole + 1),
+                                        self.viewport().mapToGlobal(pos))
+            return
         if under and under not in items:
             self.clearSelection()
             under.setSelected(True)
@@ -8911,17 +9357,28 @@ class GroupCard(QWidget):
     menuRequested = Signal(str, QPoint)
 
     def __init__(self, name: str, icons: list[QIcon], count: int, selected=False,
-                 new=False, parent=None):
+                 new=False, parent=None, box_count: int | None = None, box_icons=(),
+                 trash=False):
         super().__init__(parent)
         self.name, self.icons, self.count = name, icons, count
-        self.selected, self.new = selected, new
+        self.selected, self.new, self.trash = selected, new, trash
+        self.box_count = box_count               # None = (noch) keine Box auf dem Desktop
+        self.box_icons = list(box_icons)
         self._hover = self._drag = False
         self.setFixedSize(self.W, self.H)
         self.setAcceptDrops(True)
         self.setCursor(Qt.PointingHandCursor)
-        self.setToolTip("Objekte hierher ziehen, um eine neue Gruppe anzulegen" if new else
-                        f"{name}: {count} Objekt(e)")
-        if not new:
+        if trash:
+            tip = "Objekte hierher ziehen, um sie in den Papierkorb zu verschieben"
+        elif new:
+            tip = "Objekte hierher ziehen, um eine neue Gruppe anzulegen"
+        elif box_count is not None:
+            tip = (f"Box „{name}“ auf dem Desktop: {box_count} Objekt(e)"
+                   + (f" · {count} neu" if count else " · Objekte hierher ziehen"))
+        else:
+            tip = f"{name}: {count} Objekt(e)"
+        self.setToolTip(tip)
+        if not (new or trash):
             shadow(self, 30, 10, 80)
 
     def enterEvent(self, e):
@@ -8933,11 +9390,11 @@ class GroupCard(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, e):
-        if e.button() == Qt.LeftButton and not self.new:
+        if e.button() == Qt.LeftButton and not (self.new or self.trash):
             self.clicked.emit(self.name)
 
     def contextMenuEvent(self, e):
-        if not self.new:
+        if not (self.new or self.trash):
             self.menuRequested.emit(self.name, e.globalPos())
 
     def dragEnterEvent(self, e):
@@ -8954,61 +9411,82 @@ class GroupCard(QWidget):
         self._drag = False
         self.update()
         e.acceptProposedAction()
-        self.dropped.emit("" if self.new else self.name, decode_ids(e.mimeData()))
+        self.dropped.emit("" if (self.new or self.trash) else self.name,
+                          decode_ids(e.mimeData()))
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
-        paint_glass(p, self.rect(), 26, strength=0.6 if self.new else 1.0,
-                    tint=ACCENT if self._drag else None,
+        red = QColor("#FF453A")
+        paint_glass(p, self.rect(), 26, strength=0.6 if (self.new or self.trash) else 1.0,
+                    tint=(red if self.trash else ACCENT) if self._drag else None,
                     hover=self._hover or self._drag, active=self.selected or self._drag,
-                    dashed=self.new and not self._drag)
-        if self.new:
+                    dashed=(self.new or self.trash) and not self._drag)
+        if self.new or self.trash:
+            glyph, title, sub = (("🗑", "Papierkorb", "hierher ziehen = löschen") if self.trash
+                                 else ("+", "Neue Gruppe", "hierher ziehen"))
             f = self.font()
-            f.setPixelSize(44)
+            f.setPixelSize(36 if self.trash else 44)
             f.setWeight(QFont.Light)
             p.setFont(f)
-            p.setPen(QColor(255, 255, 255, 200))
-            p.drawText(QRectF(0, 40, self.W, 80), Qt.AlignCenter, "+")
+            p.setPen(red.lighter(130) if self.trash else QColor(255, 255, 255, 200))
+            p.drawText(QRectF(0, 40, self.W, 80), Qt.AlignCenter, glyph)
             f.setPixelSize(13)
             f.setWeight(QFont.DemiBold)
             p.setFont(f)
-            p.drawText(QRectF(0, 128, self.W, 24), Qt.AlignCenter, "Neue Gruppe")
+            p.setPen(QColor(255, 255, 255, 220))
+            p.drawText(QRectF(0, 128, self.W, 24), Qt.AlignCenter, title)
             f.setWeight(QFont.Normal)
             f.setPixelSize(11)
             p.setFont(f)
             p.setPen(TEXT_2)
-            p.drawText(QRectF(0, 150, self.W, 20), Qt.AlignCenter, "hierher ziehen")
+            p.drawText(QRectF(0, 150, self.W, 20), Qt.AlignCenter, sub)
             return
 
         cell, gap, x0, y0 = 70, 12, 18, 18
         cells = [QRectF(x0 + (i % 2) * (cell + gap), y0 + (i // 2) * (cell + gap), cell, cell)
                  for i in range(4)]
-        big = self.icons[:3] if len(self.icons) > 4 else self.icons[:4]
+        icons = self.icons or self.box_icons      # leer → Inhalt der bestehenden Box zeigen
+        if not self.icons:
+            p.setOpacity(0.45)
+        big = icons[:3] if len(icons) > 4 else icons[:4]
         for ic, c in zip(big, cells):
             p.drawPixmap(c.adjusted(5, 5, -5, -5).toRect(), ic.pixmap(120, 120))
-        if len(self.icons) > 4:                       # Mini-Raster in Zelle 4
+        if len(icons) > 4:                            # Mini-Raster in Zelle 4
             c = cells[3]
             mini = (cell - 8) / 2
-            for j, ic in enumerate(self.icons[3:7]):
+            for j, ic in enumerate(icons[3:7]):
                 r = QRectF(c.left() + (j % 2) * (mini + 8), c.top() + (j // 2) * (mini + 8),
                            mini, mini)
                 p.drawPixmap(r.adjusted(2, 2, -2, -2).toRect(), ic.pixmap(64, 64))
+        p.setOpacity(1.0)
+        if not icons:
+            f = self.font()
+            f.setPixelSize(12)
+            p.setFont(f)
+            p.setPen(TEXT_2)
+            p.drawText(QRectF(0, 60, self.W, 60), Qt.AlignCenter, "leer\nObjekte hierher ziehen")
 
         f = self.font()
         f.setPixelSize(13)
         f.setWeight(QFont.DemiBold)
         p.setFont(f)
         p.setPen(Qt.white)
-        title_r = QRectF(18, self.H - 36, self.W - 36 - 30, 22)
+        title = ("▣ " if self.box_count is not None else "") + self.name
+        title_r = QRectF(18, self.H - 36, self.W - 36 - 44, 22)
         p.drawText(title_r, Qt.AlignLeft | Qt.AlignVCenter,
-                   p.fontMetrics().elidedText(self.name, Qt.ElideRight, int(title_r.width())))
+                   p.fontMetrics().elidedText(title, Qt.ElideRight, int(title_r.width())))
         f.setWeight(QFont.Normal)
         p.setFont(f)
-        p.setPen(TEXT_2)
-        p.drawText(QRectF(self.W - 48, self.H - 36, 30, 22), Qt.AlignRight | Qt.AlignVCenter,
-                   str(self.count))
+        if self.box_count is not None:            # „+3“ neu bzw. Anzahl in der Box
+            p.setPen(QColor("#64D2FF") if self.count else TEXT_2)
+            text = f"+{self.count}" if self.count else str(self.box_count)
+        else:
+            p.setPen(TEXT_2)
+            text = str(self.count)
+        p.drawText(QRectF(self.W - 62, self.H - 36, 44, 22), Qt.AlignRight | Qt.AlignVCenter,
+                   text)
 
 
 class CardGrid(QWidget):
@@ -9021,6 +9499,7 @@ class CardGrid(QWidget):
 
     def set_cards(self, cards):
         for c in self.cards:
+            c.hide()                     # sofort weg, gelöscht wird erst in der Event-Schleife
             c.deleteLater()
         self.cards = cards
         for c in cards:
@@ -9063,6 +9542,37 @@ class Worker(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
+class OnlineJob(QObject):
+    """Nachschlagen im Hintergrund, ohne die Oberfläche zu sperren. Daemon-Thread:
+    eine hängende Anfrage hält das Beenden des Programms nicht auf."""
+    progress = Signal(int, int, str)
+    finished = Signal(dict, str)
+
+    def __init__(self, items: list[Item], parent=None, fetch=None):
+        super().__init__(parent)
+        self.items, self.fetch = items, fetch
+        self.cancel = False
+        self._thread = None
+
+    def start(self):
+        import threading
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def is_running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    def _run(self):
+        cache = online_cache_load()
+        try:
+            res, why = online_resolve(self.items, cache, self.fetch, self.progress.emit,
+                                      stop=lambda: self.cancel)
+        except Exception as e:               # noqa: BLE001 — in der GUI anzeigen
+            res, why = {}, f"Fehler: {type(e).__name__}: {e}"
+        online_cache_save(cache)
+        self.finished.emit(res, why)
+
+
 # --------------------------------------------------------------------------- #
 # Hauptfenster
 # --------------------------------------------------------------------------- #
@@ -9082,6 +9592,9 @@ class MainWindow(_Base):
         self.selected: str | None = None
         self.user_dir: Path | None = None
         self._worker: Worker | None = None
+        self._online: OnlineJob | None = None
+        self._online_mode = ""          # ohne Boxen-Verwaltung: Zustimmung nur für die Sitzung
+        self.online_results: dict[str, dict] = {}    # Pfad → Ergebnis, übersteht Neu-Scans
 
         self.setWindowTitle("Desktop Sorter")
         self.setWindowIcon(app_icon())
@@ -9119,24 +9632,77 @@ class MainWindow(_Base):
         head.addStretch(1)
 
         self.t_public = Toggle("Öffentlicher Desktop", checked=True)
-        self.t_folders = Toggle("Ordner einbeziehen")
+        self.t_folders = Toggle("Ordner einbeziehen", checked=True)
+        self.t_folders.setToolTip("Unterordner mit einsortieren. Programm-, Spiel- und "
+                                  "Projektordner (⚙) bleiben trotzdem liegen.")
         self.t_public.toggled.connect(self.rescan)
         self.t_folders.toggled.connect(self.refresh)
         self.b_scan = GlassButton("↻  Neu scannen")
-        self.b_ai = GlassButton("✦  Mit Claude sortieren")
-        self.b_undo = GlassButton("↶  Rückgängig")
         self.b_apply = GlassButton("In Boxen sortieren", primary=True)
         self.b_scan.clicked.connect(self.rescan)
-        self.b_ai.clicked.connect(self.run_ai)
-        self.b_undo.clicked.connect(self.undo)
         self.b_apply.clicked.connect(self.apply)
         for w in (self.t_public, self.t_folders):
             head.addWidget(w)
             head.addSpacing(6)
         head.addSpacing(10)
-        for w in (self.b_scan, self.b_ai, self.b_undo, self.b_apply):
+        for w in (self.b_scan, self.b_apply):
             head.addWidget(w)
         root.addLayout(head)
+
+        # Alle Funktionen an einer Stelle: Sortieren · Aufräumen · Boxen
+        tools = QHBoxLayout()
+        tools.setSpacing(8)
+        self._fence_only: list[QWidget] = []
+
+        def tool(text, slot, tip, fences=False):
+            b = GlassButton(text, small=True)
+            b.setToolTip(tip)
+            b.clicked.connect(slot)
+            tools.addWidget(b)
+            if fences:
+                self._fence_only.append(b)
+            return b
+
+        def divider():
+            line = QFrame()
+            line.setFixedSize(1, 22)
+            line.setStyleSheet("background: rgba(255,255,255,45);")
+            tools.addSpacing(6)
+            tools.addWidget(line)
+            tools.addSpacing(6)
+
+        self.b_ai = tool("✦  Mit Claude", self.run_ai,
+                         "Unklare Objekte per KI zuordnen (API-Schlüssel nötig)")
+        self.b_online = tool("🌐  Online nachschlagen", lambda: self.online_lookup(),
+                             "Unklare Ordner und Verknüpfungen bei Wikidata/Wikipedia "
+                             "nachschlagen – z. B. ob „Diablo III“ ein Spiel ist.\n"
+                             "Gesendet wird nur der bereinigte Name.")
+        self.b_undo = tool("↶  Rückgängig", self.undo, "Letzte Sortierung vollständig umkehren")
+        divider()
+        self.b_org = tool("📁  Ordner-Assistent ▾", self.show_organizer_menu,
+                          "Beliebigen Ordner analysieren, sortieren und sicher aufräumen", True)
+        self.b_clean = tool("🧹  Downloads", lambda: self.fences.open_cleaner(downloads_dir()),
+                            "Downloads im Tinder-Stil durchwischen: links = Papierkorb, "
+                            "rechts = behalten", True)
+        self.b_trash = tool("🗑  Papierkorb", self.trash_selected,
+                            "Markierte Objekte in den Papierkorb verschieben (Taste Entf)")
+        divider()
+        self.b_newbox = tool("+  Neue Box", self.new_box, "Leere Glas-Box anlegen", True)
+        self.b_arrange = tool("▦  Anordnen", lambda: self.fences.arrange_all(),
+                              "Alle Boxen ordentlich nebeneinander anordnen", True)
+        self.b_vis = tool("◐  Ausblenden", self.toggle_boxes,
+                          "Boxen auf dem Desktop aus- bzw. einblenden", True)
+        self.b_more = tool("☰  Mehr ▾", self.show_more_menu,
+                           "Ordner-Boxen, Layouts, Einstellungen, Beenden", True)
+        tools.addStretch(1)
+        root.addLayout(tools)
+        if not self.fences:
+            for b in self._fence_only:
+                b.setToolTip(b.toolTip() + "\n(nur im Normalbetrieb mit Boxen)")
+        else:
+            self.fences.visibilityChanged.connect(self._update_vis_button)
+            self._update_vis_button(self.fences.visible)
+            self.fences.renamed.connect(self._box_renamed)
 
         body = QHBoxLayout()
         body.setSpacing(18)
@@ -9160,8 +9726,11 @@ class MainWindow(_Base):
         self.detail_title = QLabel("Gruppe anklicken, um ihren Inhalt zu sehen")
         self.detail_title.setObjectName("h3")
         self.detail_list = ItemList(icon=44)
-        self.detail_list.dropped.connect(lambda ids: self.selected and self.assign(ids, self.selected))
+        self.detail_list.dropped.connect(self._drop_on_detail)
         self.detail_list.menuRequested.connect(self.item_menu)
+        self.detail_list.pathMenuRequested.connect(self.path_menu)
+        self.detail_list.pathActivated.connect(self.open_item)
+        self.detail_list.deleteRequested.connect(self.trash_items)
         dl.addWidget(self.detail_title)
         dl.addWidget(self.detail_list, 1)
         left.addWidget(self.detail)
@@ -9190,13 +9759,15 @@ class MainWindow(_Base):
         self.desk_list.dropped.connect(self.keep)
         self.desk_list.menuRequested.connect(self.item_menu)
         self.desk_list.activated_.connect(lambda i: self.accept_suggestions([i]))
+        self.desk_list.deleteRequested.connect(self.trash_items)
         rl.addWidget(self.desk_list, 1)
         body.addWidget(self.desk)
         root.addLayout(body, 1)
 
-        self.busy_widgets = [self.b_scan, self.b_ai, self.b_undo, self.b_apply,
-                             self.b_accept, self.t_public, self.t_folders,
-                             self.grid, self.detail, self.desk]
+        self.busy_widgets = [self.b_scan, self.b_ai, self.b_online, self.b_undo, self.b_apply,
+                             self.b_trash, self.b_accept, self.t_public, self.t_folders,
+                             self.grid, self.detail, self.desk] + self._fence_only
+        self.set_busy(None)
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -9212,28 +9783,54 @@ class MainWindow(_Base):
         if self.isVisible() and self.items and not busy:
             self.refresh()
 
-    def known_groups(self, groups=None) -> list[str]:
-        names = list(groups or []) + [c for c in CATEGORIES if c != "Sonstiges"]
-        names += [c for c, _ in self.toml_rules] + self.memory.groups
+    def box_dirs(self) -> dict[str, Path]:
+        """Bestehende Glas-Boxen (Ordner im Box-Speicher) – immer als Ziel verfügbar."""
         if self.fences:
-            names = self.fences.names() + names     # bestehende Boxen zuerst
+            return self.fences.group_dirs()
+        try:
+            return {d.name: d for d in sorted(self.args.storage.iterdir())
+                    if d.is_dir() and not d.name.startswith(".")}
+        except OSError:
+            return {}
+
+    @staticmethod
+    def box_entries(folder: Path) -> list[Path]:
+        try:
+            return sorted((p for p in folder.iterdir() if p.name.lower() != "desktop.ini"
+                           and not p.name.startswith(".")), key=lambda p: p.name.lower())
+        except OSError:
+            return []
+
+    def known_groups(self, groups=None) -> list[str]:
+        names = list(self.box_dirs())                # bestehende Boxen zuerst
+        names += list(groups or []) + [c for c in CATEGORIES if c != "Sonstiges"]
+        names += [c for c, _ in self.toml_rules] + self.memory.groups
         return list(dict.fromkeys(names))
 
     def plan(self):
-        """Unklare Objekte bleiben bis zur Entscheidung auf dem Desktop."""
+        """Unklare Objekte bleiben bis zur Entscheidung auf dem Desktop. Was zu einer
+        bestehenden Box passt, kommt auch einzeln hinein."""
         inc = self.t_folders.isChecked()
         pool = [it for it in self.items if it.kind != "folder" or inc]
         sure = [it for it in pool if it.confidence != "low"]
         groups, left = plan(sure, self.args.min_group, inc)
+        boxes = self.box_dirs()
+        for it in [i for i in left if i.category in boxes and i.confidence != "keep"]:
+            groups.setdefault(it.category, []).append(it)
+            left.remove(it)
         unclear = [it for it in pool if it.confidence == "low"]
         return groups, unclear + sorted(left, key=lambda i: i.label.lower())
 
     def set_busy(self, text: str | None):
         for w in self.busy_widgets:
-            w.setEnabled(text is None)
+            w.setEnabled(text is None and (self.fences is not None or w not in self._fence_only))
+        if self._online and self._online.is_running():
+            self.b_online.setEnabled(False)
         if text:
             self.subtitle.setText(text)
-        QApplication.setOverrideCursor(Qt.WaitCursor) if text else QApplication.restoreOverrideCursor()
+        if bool(text) != getattr(self, "_busy", False):
+            self._busy = bool(text)
+            QApplication.setOverrideCursor(Qt.WaitCursor) if text else QApplication.restoreOverrideCursor()
 
     def run_bg(self, text, fn, on_done):
         self.set_busy(text)
@@ -9265,74 +9862,134 @@ class MainWindow(_Base):
             rules = self.toml_rules + self.memory.rules()
             skip = set(CATEGORIES) | {c for c, _ in rules} | set(self.memory.groups)
             items = scan(user, public, skip)
+            install_dirs = installed_locations() if any(i.kind == "folder" for i in items) else set()
             for it in items:
                 classify(it, rules, self.memory)
+                classify_folder(it, install_dirs)    # Programmordner bleiben liegen
             return user, items
 
         def done(res):
             self.user_dir, self.items = res
+            for it in self.items:
+                if str(it.path) in self.online_results:
+                    apply_online(it, self.online_results[str(it.path)], self.memory.alias)
             self.refresh()
+            pending = [it for it in online_candidates(self.items)
+                       if str(it.path) not in self.online_results]
+            if self.online_mode() == "auto" and pending:
+                QTimer.singleShot(300, lambda: self.online_lookup(auto=True, items=pending))
 
         self.run_bg("Scanne Desktop …", job, done)
 
     def refresh(self):
         groups, left = self.plan()
-        if self.selected not in groups:
+        boxes = {n: self.box_entries(d) for n, d in self.box_dirs().items()}
+        names = list(groups) + [b for b in boxes if b not in groups]
+        if self.selected not in names:
             self.selected = None
+        index = {id(it): i for i, it in enumerate(self.items)}
 
         cards = []
-        for name, its in groups.items():
+        for name in names:
+            its = groups.get(name, [])
+            box = boxes.get(name)
             c = GroupCard(name, [self.icon_for(i) for i in its[:7]], len(its),
-                          selected=name == self.selected)
+                          selected=name == self.selected,
+                          box_count=None if box is None else len(box),
+                          box_icons=[self.icons.get(p) for p in (box or [])[:7]])
             c.clicked.connect(self.select_group)
             c.dropped.connect(self.on_card_drop)
             c.menuRequested.connect(self.card_menu)
             cards.append(c)
         new = GroupCard("", [], 0, new=True)
         new.dropped.connect(self.on_card_drop)
-        cards.append(new)
+        trash = GroupCard("", [], 0, trash=True)
+        trash.dropped.connect(lambda _n, ids: QTimer.singleShot(0, lambda: self.trash_items(ids)))
+        cards += [new, trash]
         self.grid.set_cards(cards)
 
         self.desk_list.clear()
-        unclear = 0
+        unclear = progs = 0
         for it in left:
             low = it.confidence == "low"
+            prog = it.role in ONLINE_LEAVE and not low
             unclear += low
-            li = QListWidgetItem(badge_icon(self.icon_for(it)) if low else self.icon_for(it),
-                                 it.label)
-            li.setData(Qt.UserRole, self.items.index(it))
-            li.setToolTip(
-                (f"Unklar — Vorschlag: {it.category} ({it.reason})\nDoppelklick = übernehmen"
-                 if it.category != "Sonstiges" else "Unklar — keine Zuordnung gefunden")
-                if low else f"Bleibt auf dem Desktop ({it.reason})")
+            progs += prog
+            icon = self.icon_for(it)
+            if low:
+                icon = badge_icon(icon)
+            elif prog:
+                icon = badge_icon(icon, text="⚙", color=QColor("#5E5CE6") if it.role == "program"
+                                  else QColor("#30B0C7"))
+            li = QListWidgetItem(icon, it.label)
+            li.setData(Qt.UserRole, index[id(it)])
+            if low:
+                tip = (f"Unklar — Vorschlag: {it.category} ({it.reason})\nDoppelklick = übernehmen"
+                       if it.category != "Sonstiges" else
+                       "Unklar — keine Zuordnung gefunden" + (f"\n{it.reason}" if "Online:" in it.reason else ""))
+            elif prog:
+                tip = (f"Bleibt liegen, damit es weiter funktioniert:\n{it.reason}\n"
+                       f"Auf eine Gruppe ziehen verschiebt trotzdem (mit Rückfrage).")
+            else:
+                tip = f"Bleibt auf dem Desktop ({it.reason})"
+            li.setToolTip(tip)
             self.desk_list.addItem(li)
-        self.desk_sub.setText(f"{unclear} unklar · {len(left) - unclear} bleiben"
-                              if unclear else f"{len(left)} bleiben · alles zugeordnet")
+        parts = [f"{unclear} unklar"] if unclear else []
+        parts += [f"{progs} Programmordner"] if progs else []
+        parts += [f"{len(left) - unclear - progs} bleiben"]
+        self.desk_sub.setText(" · ".join(parts) + ("" if unclear else " · alles zugeordnet"))
         self.b_accept.setVisible(any(i.confidence == "low" and i.category != "Sonstiges"
                                      for i in left))
 
         self.detail_list.clear()
         self.detail_list.setAcceptDrops(self.selected is not None)
         if self.selected:
-            its = groups[self.selected]
-            self.detail_title.setText(f"{self.selected}  ·  {len(its)} Objekte")
+            its = groups.get(self.selected, [])
+            box = boxes.get(self.selected)
+            if box is None:
+                info = f"{len(its)} Objekte"
+            elif its:
+                info = f"{len(its)} neu  ·  {len(box)} bereits in der Box"
+            else:
+                info = f"{len(box)} in der Box  ·  Objekte hierher ziehen, um sie hinzuzufügen"
+            self.detail_title.setText(("▣ " if box is not None else "") +
+                                      f"{self.selected}  ·  {info}")
             for it in its:
                 li = QListWidgetItem(self.icon_for(it), it.label)
-                li.setData(Qt.UserRole, self.items.index(it))
+                li.setData(Qt.UserRole, index[id(it)])
                 li.setToolTip(it.reason)
                 self.detail_list.addItem(li)
+            for p in box or []:                     # schon in der Box: nur ansehen/öffnen
+                li = QListWidgetItem(faded_icon(self.icons.get(p)), display_name(p))
+                li.setData(Qt.UserRole, -1)
+                li.setData(Qt.UserRole + 1, str(p))
+                li.setFlags(Qt.ItemIsEnabled)
+                li.setToolTip("Bereits in der Box · Doppelklick öffnet · Rechtsklick für mehr")
+                self.detail_list.addItem(li)
         else:
-            self.detail_title.setText("Gruppe anklicken, um ihren Inhalt zu sehen")
+            self.detail_title.setText("Gruppe oder Box anklicken, um ihren Inhalt zu sehen")
 
         n_items = sum(len(g) for g in groups.values())
         self.subtitle.setText(f"{len(self.items)} Objekte gefunden  ·  {n_items} werden in "
-                              f"{len(groups)} Gruppen sortiert  ·  {unclear} unklar")
+                              f"{len(groups)} Gruppen sortiert  ·  {len(boxes)} Boxen  ·  "
+                              f"{unclear} unklar")
 
     def later_refresh(self):
         QTimer.singleShot(0, self.refresh)   # nach Ende des Drag-Vorgangs
 
     # ---------- Aktionen auf Objekten ----------
     def assign(self, ids, group: str):
+        ids = [i for i in ids if 0 <= i < len(self.items)]
+        progs = [self.items[i] for i in ids
+                 if self.items[i].role in ONLINE_LEAVE and self.items[i].confidence != "user"]
+        if progs and not self.confirm(
+                "Programmordner verschieben?",
+                "Diese Ordner sehen nach installierten Programmen, Spielen oder Projekten aus:\n\n"
+                + "\n".join(f"• {p.label} – {p.reason}" for p in progs[:8])
+                + "\n\nNach dem Verschieben funktionieren Verknüpfungen, Startmenü-Einträge, "
+                  "Updates oder die Entwicklungsumgebung oft nicht mehr.\n\n"
+                  f"Trotzdem in „{group}“ einsortieren?"):
+            return
         for i in ids:
             it = self.items[i]
             it.category, it.reason, it.confidence = group, "deine Auswahl", "user"
@@ -9375,17 +10032,34 @@ class MainWindow(_Base):
         return name
 
     def on_card_drop(self, group, ids):
+        QTimer.singleShot(0, lambda: self._card_drop(group, ids))   # Dialoge erst nach dem Drag
+
+    def _card_drop(self, group, ids):
         if not group:
             group = self.ask_group_name()
             if not group:
                 return
         self.assign(ids, group)
 
+    def _drop_on_detail(self, ids):
+        if self.selected:
+            group = self.selected
+            QTimer.singleShot(0, lambda: self.assign(ids, group))
+
     def select_group(self, name):
         self.selected = None if self.selected == name else name
         self.refresh()
 
+    def open_item(self, path):
+        try:
+            open_path(str(path))
+        except OSError as e:
+            self.message("Öffnen", f"Konnte nicht öffnen:\n{path}\n\n{e}", warn=True)
+
     def item_menu(self, ids, pos):
+        ids = [i for i in ids if 0 <= i < len(self.items)]
+        if not ids:
+            return
         its = [self.items[i] for i in ids]
         groups, _ = self.plan()
         m = glass_menu(self)
@@ -9394,19 +10068,219 @@ class MainWindow(_Base):
             hint = f": {one.category}" if one else ""
             m.addAction(f"✓  Vorschlag übernehmen{hint}", lambda: self.accept_suggestions(ids))
         sub = glass_menu(m, "Verschieben nach")
+        boxes = self.box_dirs()
         for g in self.known_groups(groups):
-            act = sub.addAction(g, lambda g=g: self.assign(ids, g))
+            act = sub.addAction(("▣  " if g in boxes else "") + g, lambda g=g: self.assign(ids, g))
             act.setEnabled(not (one and one.category == g and one.confidence != "low"))
         m.addMenu(sub)
         m.addAction("+  Neue Gruppe …", lambda: (n := self.ask_group_name()) and self.assign(ids, n))
         m.addAction("⌂  Auf dem Desktop lassen", lambda: self.keep(ids))
         m.addSeparator()
         if one:
-            m.addAction("↗  Öffnen", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(one.path))))
+            m.addAction("▶  Öffnen", lambda: self.open_item(one.path))
+            m.addAction("↗  Dateispeicherort öffnen", lambda: reveal_path(str(one.path)))
+            if one.kind == "folder" and self.fences:
+                m.addAction("📁  Mit Ordner-Assistent aufräumen …",
+                            lambda: self.fences.open_organizer(one.path))
             if one.category != "Sonstiges":
                 m.addAction(f"★  Als Regel für „{one.category}“ merken …",
                             lambda: self.remember_rule(one))
+        web = [i for i in its if i.kind in ("folder", "lnk", "url") and online_clean_name(i.label)]
+        if web:
+            act = m.addAction("🌐  Online nachschlagen", lambda: self.online_lookup(items=web))
+            act.setEnabled(not (self._online and self._online.is_running()))
+        m.addSeparator()
+        m.addAction("🗑  In den Papierkorb …", lambda: self.trash_items(ids))
         m.exec(pos)
+
+    def path_menu(self, path: str, pos):
+        """Rechtsklick auf etwas, das schon in einer Box liegt."""
+        m = glass_menu(self)
+        m.addAction("▶  Öffnen", lambda: self.open_item(path))
+        m.addAction("↗  Dateispeicherort öffnen", lambda: reveal_path(path))
+        if self.fences:
+            m.addAction("⌂  Zurück auf den Desktop", lambda: self.back_to_desktop([path]))
+        m.addSeparator()
+        m.addAction("🗑  In den Papierkorb …", lambda: self.trash_paths([Path(path)]))
+        m.exec(pos)
+
+    def back_to_desktop(self, paths):
+        self.fences.to_desktop(paths)
+        self.rescan()
+
+    # ---------- Papierkorb ----------
+    def trash_selected(self):
+        ids = self.desk_list.ids(self.desk_list.selectedItems())
+        ids += self.detail_list.ids(self.detail_list.selectedItems())
+        ids = [i for i in dict.fromkeys(ids) if i >= 0]
+        if not ids:
+            return self.message("Papierkorb", "Erst Objekte markieren – oder sie auf die Karte "
+                                              "„Papierkorb“ ziehen.")
+        self.trash_items(ids)
+
+    def trash_items(self, ids):
+        its = [self.items[i] for i in dict.fromkeys(ids) if 0 <= i < len(self.items)]
+        if its:
+            self.trash_paths([it.path for it in its])
+
+    def trash_paths(self, paths: list[Path]):
+        """Nach Rückfrage in den Papierkorb – nie endgültig löschen. Warnt bei
+        Programmordnern, wichtigen Dokumenten und geschützten Dateien."""
+        paths = [Path(p) for p in paths if Path(p).exists() or Path(p).is_symlink()]
+        if not paths:
+            return
+        by_path = {str(it.path): it for it in self.items}
+        protected = set(self.fences.cfg.get("protected", [])) if self.fences else set()
+        warn_prog, warn_important = [], []
+        for p in paths:
+            it = by_path.get(str(p))
+            role = it.role if it else (folder_role(p)[0] if p.is_dir() else "")
+            if role in ONLINE_LEAVE:
+                warn_prog.append(p.name)
+            if str(p) in protected:
+                warn_important.append(f"{display_name(p)} (von dir als wichtig geschützt)")
+                continue
+            if p.is_file() and p.suffix.lower() not in (".lnk", ".url"):
+                cat = org_classify_document(p.name, "", org_kind(p))[0]
+                if cat and ORG_CATEGORIES[cat]["tier"] == ORG_PROTECT:
+                    warn_important.append(f"{p.name} ({ORG_CATEGORIES[cat]['label']})")
+        names = "\n".join(f"• {display_name(p)}" for p in paths[:10])
+        if len(paths) > 10:
+            names += f"\n… und {len(paths) - 10} weitere"
+        text = (f"{len(paths)} Objekt(e) in den Papierkorb verschieben?\n\n{names}\n\n"
+                f"Aus dem Papierkorb jederzeit wiederherstellbar.")
+        if warn_prog:
+            text += ("\n\n⚠ Programm-/Projektordner: " + ", ".join(warn_prog) +
+                     "\nProgramme besser über Einstellungen → Apps deinstallieren – sonst "
+                     "bleiben Registry-Einträge und Verknüpfungen ins Leere zurück.")
+        if warn_important:
+            text += "\n\n⚠ Wirkt wichtig:\n" + "\n".join(f"• {w}" for w in warn_important[:8])
+        if not self.confirm("In den Papierkorb", text):
+            return
+        failed = [display_name(p) for p in paths if not safe_trash(p)]
+        if failed:
+            self.message("Papierkorb", f"{len(failed)} Objekt(e) nicht verschoben – "
+                         f"{TRASH_FAIL_HINT}. Auf dem öffentlichen Desktop sind "
+                         f"Administratorrechte nötig.\n\n" + "\n".join(failed[:15]), warn=True)
+        if len(failed) < len(paths):
+            self.subtitle.setText(f"{len(paths) - len(failed)} Objekt(e) im Papierkorb")
+            self.rescan()
+
+    # ---------- Boxen ----------
+    def new_box(self):
+        self.fences.new_box()
+        self.refresh()
+
+    def toggle_boxes(self):
+        self.fences.set_visible(not self.fences.visible)
+
+    def _update_vis_button(self, visible: bool):
+        self.b_vis.setText("◐  Ausblenden" if visible else "◑  Einblenden")
+        self.b_vis.updateGeometry()
+
+    def _menu_below(self, menu: QMenu, button: QWidget):
+        menu.exec(button.mapToGlobal(QPoint(0, button.height() + 4)))
+
+    def show_organizer_menu(self):
+        self._menu_below(self.fences.organizer_menu(self), self.b_org)
+
+    def show_more_menu(self):
+        f = self.fences
+        m = glass_menu(self)
+        m.addAction("+  Neue Ordner-Box …", lambda: (f.new_portal(), self.refresh()))
+        m.addMenu(f.layouts_menu(m))
+        m.addMenu(f.settings_menu(m))
+        auto = m.addAction("🌐  Unklares nach jedem Scan online nachschlagen")
+        auto.setCheckable(True)
+        auto.setChecked(self.online_mode() == "auto")
+        auto.toggled.connect(self.set_online_auto)
+        if self.args.rules:
+            m.addAction("✎  Eigene Regeln bearbeiten (regeln.toml)",
+                        lambda: self.open_item(self.args.rules))
+        m.addSeparator()
+        m.addAction("⏻  Desktop Sorter beenden", QApplication.quit)
+        self._menu_below(m, self.b_more)
+
+    # ---------- Online nachschlagen (Wikidata / Wikipedia) ----------
+    def online_mode(self) -> str:
+        """"" = noch nicht erlaubt, "manual" = auf Knopfdruck, "auto" = nach jedem Scan."""
+        return (self.fences.cfg.get("online_lookup", "") if self.fences else self._online_mode)
+
+    def _set_online_mode(self, mode: str):
+        if self.fences:
+            self.fences.cfg["online_lookup"] = mode
+            self.fences.write_cfg()
+        else:
+            self._online_mode = mode
+
+    def online_consent(self) -> bool:
+        if self.online_mode():
+            return True
+        box = QMessageBox(QMessageBox.Question, "Online nachschlagen",
+                          "Für unklare Ordner und Verknüpfungen fragt Desktop Sorter bei "
+                          "Wikidata und Wikipedia nach, was sich hinter dem Namen verbirgt – "
+                          "z. B. „Diablo III → Computerspiel“ oder „Arduino → Mikrocontroller-"
+                          "Plattform“.\n\nGesendet wird nur der bereinigte Name (ohne Pfade, "
+                          "ohne Inhalte, nie Dateinamen von Dokumenten). Ergebnisse werden "
+                          "90 Tage lokal zwischengespeichert.\n\n(Google bietet dafür keine "
+                          "freie Schnittstelle; Wikidata ist die offene Wissensdatenbank "
+                          "hinter vielen Suchmaschinen-Infoboxen.)", parent=self)
+        b_auto = box.addButton("Immer automatisch", QMessageBox.AcceptRole)
+        b_once = box.addButton("Nur auf Knopfdruck", QMessageBox.AcceptRole)
+        box.addButton("Abbrechen", QMessageBox.RejectRole)
+        box.setDefaultButton(b_once)
+        box.exec()
+        mode = {b_auto: "auto", b_once: "manual"}.get(box.clickedButton(), "")
+        if mode:
+            self._set_online_mode(mode)
+        return bool(mode)
+
+    def set_online_auto(self, on: bool):
+        if on and not self.online_mode() and not self.online_consent():
+            return
+        self._set_online_mode("auto" if on else ("manual" if self.online_mode() else ""))
+        if on:
+            self.online_lookup(auto=True)
+
+    def online_lookup(self, auto=False, items=None):
+        if self._online and self._online.is_running():
+            return
+        todo = list(items) if items else online_candidates(self.items)
+        if not todo:
+            if not auto:
+                self.message("Online nachschlagen", "Nichts nachzuschlagen: keine unklaren "
+                             "Ordner oder Verknüpfungen mit einem verwertbaren Namen.")
+            return
+        if not self.online_consent():
+            return
+        self._online = OnlineJob(todo[:ONLINE_MAX], self)
+        self._online.progress.connect(self._online_progress)
+        self._online.finished.connect(self._online_done)
+        self.b_online.setEnabled(False)
+        self.b_online.setText(f"🌐  0/{len(self._online.items)} …")
+        self._online.start()
+
+    def _online_progress(self, n: int, total: int, name: str):
+        self.b_online.setText(f"🌐  {n}/{total} …")
+
+    def _online_done(self, results: dict, why: str):
+        self.b_online.setText("🌐  Online nachschlagen")
+        self.b_online.setEnabled(not getattr(self, "_busy", False))
+        self.online_results.update(results)
+        by_path = {str(it.path): it for it in self.items}
+        changed = sum(apply_online(by_path[p], r, self.memory.alias) for p, r in results.items() if p in by_path)
+        found = sum(bool(r.get("description")) for r in results.values())
+        if not (self._worker and self._worker.isRunning()):
+            self.refresh()
+        note = (f"Online nachgeschlagen: {found} von {len(results)} erkannt, "
+                f"{changed} neu zugeordnet")
+        if why == "limit":
+            note += " · Wikimedia bremst gerade, später erneut versuchen"
+        elif why == "offline":
+            note += " · keine Verbindung zu Wikidata/Wikipedia"
+        elif why:
+            note += f" · {why}"
+        self.subtitle.setText(note)
 
     def remember_rule(self, it: Item):
         stem = it.label.split("_")[0].split(" ")[0]
@@ -9419,11 +10293,41 @@ class MainWindow(_Base):
 
     def card_menu(self, name, pos):
         m = glass_menu(self)
-        m.addAction("✎  Umbenennen …", lambda: self.rename_group(name))
-        m.addAction("⌂  Auflösen (alles auf dem Desktop lassen)",
-                    lambda: self.keep([self.items.index(i) for i in self.items
-                                       if i.category == name and i.confidence != "low"]))
+        box = self.box_dirs().get(name)
+        planned = [i for i, it in enumerate(self.items)
+                   if it.category == name and it.confidence not in ("low", "keep")]
+        fence = self.fences.fences.get(name) if self.fences else None
+        if box is not None:
+            m.addAction("↗  Box-Ordner öffnen", lambda: self.open_item(box))
+            if fence:
+                m.addAction("✎  Box umbenennen …", lambda: self.rename_box(name))
+        else:
+            m.addAction("✎  Umbenennen …", lambda: self.rename_group(name))
+        if planned:
+            m.addAction("⌂  Neue Objekte nicht einsortieren" if box is not None
+                        else "⌂  Auflösen (alles auf dem Desktop lassen)",
+                        lambda: self.keep(planned))
+        if fence:
+            m.addSeparator()
+            m.addAction("⌂  Box auflösen (Inhalt zurück auf den Desktop) …",
+                        lambda: (self.fences.dissolve(fence), self.rescan()))
         m.exec(pos)
+
+    def rename_box(self, old):
+        fence = self.fences.fences.get(old)
+        if fence:
+            self.fences.rename(fence)          # meldet sich über fences.renamed zurück
+
+    def _box_renamed(self, old: str, new: str):
+        """Box wurde umbenannt (hier oder auf dem Desktop): alles folgt dem neuen Namen."""
+        for it in self.items:
+            if it.category == old:
+                it.category = new
+        self.memory.renamed(old, new)
+        self.memory.save()
+        if self.selected == old:
+            self.selected = new
+        self.refresh()
 
     def rename_group(self, old):
         new = self.ask_group_name(old)
@@ -9456,7 +10360,8 @@ class MainWindow(_Base):
         def job():
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
-                classify_with_claude(todo, self.items, self.args.model)
+                classify_with_claude(todo, self.items, self.args.model,
+                                     extra_groups=list(self.box_dirs()))
             return err.getvalue().strip()
 
         def done(msg):
@@ -9512,6 +10417,8 @@ class MainWindow(_Base):
             e.ignore()
             self.hide()
         else:
+            if self._online:
+                self._online.cancel = True
             super().closeEvent(e)
 
     # ---------- Dialoge ----------
@@ -10424,6 +11331,7 @@ class FenceManager(QObject):
     openManager = Signal()
     visibilityChanged = Signal(bool)
     notify = Signal(str, str)
+    renamed = Signal(str, str)          # Box umbenannt (alt, neu)
 
     def __init__(self, storage: Path, rules_path: Path | None = None,
                  memory_path: Path | None = None):
@@ -10781,19 +11689,33 @@ class FenceManager(QObject):
         self.sync()
 
     def rename(self, fence: Fence):
-        new = ask_box_name("Box umbenennen", fence.name)
-        if not new or new == fence.name or new in self.sources():
+        old = fence.name
+        new = ask_box_name("Box umbenennen", old)
+        if not new or new == old or new in self.sources():
             return
         if not fence.portal:
-            (self.storage / fence.name).rename(self.storage / new)
+            try:
+                (self.storage / old).rename(self.storage / new)
+            except OSError as e:
+                QMessageBox.warning(None, "Desktop Sorter", f"Umbenennen nicht möglich:\n{e}")
+                return
             fence.folder = self.storage / new
-        self.cfg["boxes"][new] = self.cfg["boxes"].pop(fence.name, {})
-        self.fences[new] = self.fences.pop(fence.name)
+        self.cfg["boxes"][new] = self.cfg["boxes"].pop(old, {})
+        self.fences[new] = self.fences.pop(old)
         fence.name = new
         fence.setWindowTitle(new)
         fence.update()
         self.write_cfg()
+        if not fence.portal and self.memory_path:   # künftige Zuordnungen folgen dem neuen Namen
+            try:
+                mem = Memory(self.memory_path)
+                mem.renamed(old, new)
+                mem.save()
+            except (OSError, ValueError):
+                pass
         self._sync.start()
+        if not fence.portal:
+            self.renamed.emit(old, new)
 
     def dissolve(self, fence: Fence):
         if fence.portal:
@@ -10909,37 +11831,46 @@ class FenceManager(QObject):
         menu.addAction("+  Neue Ordner-Box …", self.new_portal)
         menu.addAction("▦  Boxen neu anordnen", self.arrange_all)
         menu.addAction("🧹  Downloads aufräumen …", lambda: self.open_cleaner(downloads_dir()))
-        org = glass_menu(menu, "📁  Ordner-Assistent")
+        menu.addMenu(self.organizer_menu(menu))
+        menu.addMenu(self.layouts_menu(menu))
+        menu.addMenu(self.settings_menu(menu))
+        menu.addSeparator()
+        menu.addAction("⏻  Beenden", QApplication.quit)
+        return menu
+
+    def organizer_menu(self, parent: QMenu | None = None) -> QMenu:
+        org = glass_menu(parent, "📁  Ordner-Assistent")
         for label, key in (("Dokumente", "documents"), ("Downloads", "downloads"),
                            ("Bilder", "pictures"), ("Desktop", "desktop"),
                            ("Videos", "videos")):
             org.addAction(label, lambda k=key: self.open_organizer(org_known_folder(k)))
         org.addSeparator()
         org.addAction("Anderer Ordner …", self.pick_and_organize)
-        menu.addMenu(org)
+        return org
 
-        layouts = glass_menu(menu, "Layouts")
+    def layouts_menu(self, parent: QMenu | None = None) -> QMenu:
+        layouts = glass_menu(parent, "Layouts")
         layouts.aboutToShow.connect(lambda: self._fill_layouts(layouts))
-        menu.addMenu(layouts)
+        return layouts
 
-        prefs = glass_menu(menu, "Einstellungen")
-        for key, label in SETTING_LABELS.items():
-            if key in WINDOWS_ONLY_SETTINGS and not Win32.ok:
-                continue
-            act = prefs.addAction(label)
-            act.setCheckable(True)
-            act.setChecked(self.settings[key])
-            act.toggled.connect(lambda on, k=key: self.set_setting(k, on))
-        if Win32.ok:
-            prefs.addSeparator()
-            act_auto = prefs.addAction("Mit Windows starten")
-            act_auto.setCheckable(True)
-            act_auto.setChecked(self.settings["autostart"])
-            act_auto.toggled.connect(lambda on: self.set_setting("autostart", on))
-        menu.addMenu(prefs)
-        menu.addSeparator()
-        menu.addAction("⏻  Beenden", QApplication.quit)
-        return menu
+    def settings_menu(self, parent: QMenu | None = None) -> QMenu:
+        """Häkchen werden bei jedem Öffnen aus der Konfiguration gelesen."""
+        prefs = glass_menu(parent, "Einstellungen")
+        keys = [k for k in SETTING_LABELS if k not in WINDOWS_ONLY_SETTINGS or Win32.ok]
+        keys += ["autostart"] if Win32.ok else []
+
+        def fill():
+            prefs.clear()
+            for key in keys:
+                if key == "autostart":
+                    prefs.addSeparator()
+                act = prefs.addAction(SETTING_LABELS.get(key, "Mit Windows starten"))
+                act.setCheckable(True)
+                act.setChecked(bool(self.settings[key]))
+                act.toggled.connect(lambda on, k=key: self.set_setting(k, on))
+        prefs.aboutToShow.connect(fill)
+        fill()
+        return prefs
 
     def open_cleaner(self, folder: Path):
         win = getattr(self, "_cleaner", None)

@@ -21,9 +21,42 @@ Die Datei **nicht auf den Desktop** legen, sonst sortiert sie sich selbst mit ei
 
 ## Ablauf
 
-1. **Zuordnen** im Hauptfenster: Gruppen erscheinen als Glaskarten, Unklares (orange **?**) ordnest du per Drag & Drop oder Rechtsklick zu.
-2. **In Boxen sortieren**: Die Verknüpfungen wandern in `%USERPROFILE%\DesktopSorter Boxen\<Gruppe>`, und für jede Gruppe erscheint eine Glas-Box auf dem Desktop.
-3. Die App läuft danach im **Infobereich** (Tray) weiter und hält die Boxen auf dem Desktop. Sie trägt sich beim Start **automatisch in den Windows-Autostart** ein (startet dann nur Boxen + Tray, ohne Hauptfenster). Abschalten: Tray → *Einstellungen* → *Mit Windows starten*.
+1. **Zuordnen** im Hauptfenster: Gruppen erscheinen als Glaskarten, Unklares (orange **?**) ordnest du per Drag & Drop oder Rechtsklick zu. Deine **bestehenden Boxen** (▣) stehen immer als Karte bereit – auch leere –, sodass du jederzeit etwas hineinziehen kannst.
+2. **In Boxen sortieren**: Verknüpfungen, Dateien und Ordner wandern in `%USERPROFILE%\DesktopSorter Boxen\<Gruppe>`, und für jede Gruppe erscheint eine Glas-Box auf dem Desktop.
+3. Die App läuft danach im **Infobereich** (Tray) weiter und hält die Boxen auf dem Desktop. Sie trägt sich beim Start **automatisch in den Windows-Autostart** ein (startet dann nur Boxen + Tray, ohne Hauptfenster). Abschalten: *☰ Mehr* bzw. Tray → *Einstellungen* → *Mit Windows starten*.
+
+## Das Hauptfenster
+
+Alle Funktionen sind von hier aus erreichbar:
+
+| Bereich | Knöpfe |
+|---|---|
+| Kopfzeile | *Öffentlicher Desktop* · *Ordner einbeziehen* · **↻ Neu scannen** · **In Boxen sortieren** |
+| Sortieren | **✦ Mit Claude** (Unklares per KI) · **🌐 Online nachschlagen** · **↶ Rückgängig** |
+| Aufräumen | **📁 Ordner-Assistent ▾** (Dokumente, Downloads, Bilder, Desktop, Videos, anderer Ordner) · **🧹 Downloads** (Tinder-Stil) · **🗑 Papierkorb** |
+| Boxen | **+ Neue Box** · **▦ Anordnen** · **◐ Aus-/Einblenden** · **☰ Mehr ▾** (Ordner-Boxen, Layouts, Einstellungen, regeln.toml, Beenden) |
+
+| Karte / Liste | Bedeutung |
+|---|---|
+| **▣ Name +3** | bestehende Box, 3 neue Objekte kommen hinzu (ohne Neues: Anzahl in der Box, Symbole blass) |
+| **+ Neue Gruppe** | hierher ziehen → Name eingeben |
+| **🗑 Papierkorb** | hierher ziehen → nach Rückfrage in den Windows-Papierkorb (auch: Rechtsklick → *In den Papierkorb*, Taste **Entf**) |
+| orange **?** | unklar – Vorschlag per Doppelklick übernehmen |
+| lila/türkis **⚙** | Programm- bzw. Projektordner – bleibt liegen |
+
+Ein Klick auf eine Box-Karte zeigt unten ihren Inhalt: neue Objekte zum Verschieben, darunter blass, was schon in der Box liegt (Doppelklick öffnet, Rechtsklick: *Zurück auf den Desktop*, *In den Papierkorb*). Rechtsklick auf eine Box-Karte: *Box-Ordner öffnen*, *Box umbenennen*, *Box auflösen*.
+
+**Unterordner** werden mit einsortiert (*Ordner einbeziehen*, Standard an) – aber nur, wenn es Inhaltsordner sind (Fotos, Dokumente, Musik …). **Programm-, Spiel- und Projektordner bleiben liegen**, damit sie weiter funktionieren:
+
+| Erkannt als | Woran |
+|---|---|
+| Programm / Spiel ⚙ | in Windows als installiertes Programm eingetragen (Registry `InstallLocation`) · `.exe`/`.dll`/`.jar`/`.pak` in den ersten zwei Ebenen · Spuren wie `.build.info` (Blizzard), `steam_appid.txt`, `UnityPlayer.dll`, `unins000.exe` |
+| Projekt ⚙ | `.git`, `.sln`/`.csproj`/`.vcxproj`, `CMakeLists.txt`, `package.json` + Code … – auch eine Ebene tiefer (z. B. *Visual Studio/Projects/…*) · Arduino-Sketche (`.ino`) |
+| Inhalt | ≥ 60 % einer Dateiart → passende Gruppe (z. B. Fotos → *Bilder & Grafik*); Ordnernamen wie *Bewerbung* → *Büro & Dokumente*, *Steuer 2023* → *Finanzen* |
+
+Wer einen Programmordner trotzdem einsortieren oder löschen will, wird vorher gewarnt.
+
+**Online nachschlagen** fragt für unklare Ordner und Verknüpfungen bei **Wikidata/Wikipedia** nach, was hinter dem Namen steckt („Diablo III → Computerspiel → *Spiele*“, „Arduino → Mikrocontroller-Plattform → *Entwicklung*“). Ordner, die online als Software gelten, werden zusätzlich tief nach Programmdateien durchsucht – findet sich eine `.exe`, bleibt der Ordner liegen. Beim ersten Mal wählst du *Immer automatisch* (nach jedem Scan) oder *Nur auf Knopfdruck*; umstellbar unter *☰ Mehr*. Google bietet für solche Abfragen keine freie Schnittstelle; Wikidata ist die offene Wissensdatenbank hinter vielen Suchmaschinen-Infoboxen.
 
 ## Die Boxen
 
@@ -109,13 +142,17 @@ Tray → **🧹 Downloads aufräumen …** (oder bei einer Ordner-Box: Rechtskli
 
 Jedes Objekt durchläuft diese Stufen; die erste, die greift, entscheidet:
 
-1. **Deine Entscheidungen** aus früheren Läufen (`entscheidungen.json`)
+1. **Deine Entscheidungen** aus früheren Läufen (`entscheidungen.json`) – benennst du eine Box um, folgen Entscheidungen und künftige Zuordnungen dem neuen Namen
 2. **Eigene Regeln** aus `regeln.toml` – z. B. Projektthemen wie „Hausplanung“
-3. **App-Wissensbasis** – Name und Ziel-EXE der Verknüpfung
-4. **Spiele-Erkennung** – Ziel liegt in Steam-, Epic-, EA-, Ubisoft-Bibliotheken oder ist ein `steam://`-Link
-5. **Stichwörter** im Dateinamen (Rechnung, Bestellung, …)
-6. **Dateityp** – nur als Vorschlag; solche Objekte gelten als *unklar*
-7. **Optional Claude** – ordnet Unklares semantisch zu und darf eigene Themen bilden
+3. **Stichwörter** im Dateinamen (Rechnung, Bestellung, …) – bei Dateien vor der App-Erkennung: Thema schlägt Dateityp
+4. **App-Wissensbasis** – Name und Ziel-EXE der Verknüpfung (bei Dateien ohne Endung verglichen)
+5. **Spiele-Erkennung** – Ziel liegt in Steam-, Epic-, EA-, Ubisoft-Bibliotheken oder ist ein `steam://`-Link
+6. **Dokument-Lexikon** (DE/EN, aus dem Ordner-Assistenten) – *Lebenslauf*, *CV*, *Arbeitszeugnis*, *Mietvertrag*, *Gehaltsabrechnung* … → *Büro & Dokumente* bzw. *Finanzen*
+7. **Ordner** – Programm/Projekt bleibt liegen, sonst nach Inhalt oder Name (siehe oben)
+8. **Dateityp** – nur als Vorschlag; solche Objekte gelten als *unklar*
+9. **Optional online** (Wikidata/Wikipedia) oder **Claude** – ordnen Unklares zu; Claude bevorzugt deine bestehenden Boxen und darf eigene Themen bilden
+
+Was zu einer **bestehenden Box** passt, wird auch einzeln dort einsortiert; neue Gruppen entstehen erst ab zwei Objekten.
 
 Erfasst werden beide Desktop-Quellen, die Windows gemeinsam anzeigt: der eigene Desktop (auch OneDrive-umgeleitet) und der öffentliche Desktop (`C:\Users\Public\Desktop`).
 
@@ -127,7 +164,7 @@ Erfasst werden beide Desktop-Quellen, die Windows gemeinsam anzeigt: der eigene 
 | `regeln.toml` | eigene Themen; wird beim ersten Start angelegt und ist frei editierbar |
 | `entscheidungen.json` | deine Zuordnungen und gelernten Stichwörter (persönlich, nicht im Repo) |
 | `%USERPROFILE%\DesktopSorter Boxen\` | Inhalt der Boxen (ein Unterordner je Box) + `.boxen.json` (Positionen) |
-| `%USERPROFILE%\.desktop_sorter\` | Journale für „Rückgängig“ (Boxen und Ordner-Assistent) |
+| `%USERPROFILE%\.desktop_sorter\` | Journale für „Rückgängig“ (Boxen und Ordner-Assistent) · `online_cache.json` (Online-Ergebnisse, 90 Tage) |
 | `dev/` | Quellcode der Analyse-Engine (`dev/organizer/org_*.py`), Assistenten-Oberfläche, Tests und Build-Skript – nur für die Entwicklung nötig |
 
 Beispiel für `regeln.toml`:
@@ -140,7 +177,9 @@ Beispiel für `regeln.toml`:
 
 ## Datenschutz
 
-Ohne Claude läuft alles lokal – auch der Ordner-Assistent liest Dokumente und Fotos ausschließlich auf deinem PC. Mit **Mit Claude sortieren** (nur Desktop-Verknüpfungen) werden nur Anzeigename, Typ und Ziel der unklaren Objekte gesendet – der Benutzerpfad wird dabei durch `%USERPROFILE%` ersetzt, Dateiinhalte werden nie übertragen.
+Ohne Claude und ohne *Online nachschlagen* läuft alles lokal – auch der Ordner-Assistent liest Dokumente und Fotos ausschließlich auf deinem PC. Mit **Mit Claude** werden nur Anzeigename, Typ und Ziel der unklaren Objekte gesendet – der Benutzerpfad wird dabei durch `%USERPROFILE%` ersetzt, Dateiinhalte werden nie übertragen.
+
+**Online nachschlagen** läuft erst nach deiner Zustimmung und sendet nur den **bereinigten Namen** unklarer Ordner und Verknüpfungen an Wikidata/Wikipedia (z. B. „arduino-1.8.19-windows“ → „arduino“) – nie Pfade, Inhalte oder Namen von Dateien (Dokumentnamen sind oft persönlich). Kryptische Namen (z. B. „ZS_7805 052 430“) werden gar nicht gesendet. Höchstens 40 Namen pro Durchgang, mit Pause zwischen den Anfragen; bei Drosselung (HTTP 429) oder ohne Verbindung wird sofort aufgehört.
 
 ## Bekannte Grenzen
 
@@ -149,6 +188,8 @@ Ohne Claude läuft alles lokal – auch der Ordner-Assistent liest Dokumente und
 - Unter Windows 10 sind die Ecken der Boxen eckig (runde Fensterecken gibt es erst ab Windows 11).
 - **Explorer-Rechtsklick:** Unter Windows 11 erscheint der Eintrag im klassischen Menü (*Weitere Optionen anzeigen* bzw. Umschalt + Rechtsklick); das neue Kurzmenü erlaubt Einträge nur für installierte App-Pakete.
 - **Ordner-Assistent:** Die Erkennung arbeitet mit Stichwörtern (DE/EN) im Dateinamen und Textanfang, ohne Texterkennung (OCR) – gescannte PDFs ohne Textebene werden nur über den Namen erkannt. Pro Analyse werden höchstens 60 000 Dateien betrachtet, Text ~25 s und Foto-Daten ~60 s lang gelesen; darüber hinaus zählt nur der Dateiname.
+- **Programmordner-Erkennung** ist eine Heuristik: Ein Programm ohne `.exe`/`.dll` in den ersten zwei Ebenen, das nicht in der Registry steht, gilt als Inhaltsordner – im Zweifel *Online nachschlagen* (prüft dann tiefer) oder per Rechtsklick *Auf dem Desktop lassen*. Umgekehrt bleibt ein Inhaltsordner mit einzelner `.exe` lieber liegen.
+- **Online nachschlagen** findet nur, was in Wikidata/Wikipedia steht (Programme, Spiele, Marken); private Projektnamen bleiben unklar.
 - Die Windows-spezifischen Teile (Registry, Papierkorb-Prüfung, Junctions, OneDrive-Attribute) sind automatisiert, aber nicht auf echtem Windows getestet.
 
 ## Entwicklung
@@ -157,7 +198,7 @@ Die Analyse-Engine liegt als einzelne, getestete Module in `dev/organizer/` und 
 
 ```powershell
 py dev/assemble.py        # Engine + Assistenten-Oberfläche in DesktopSorter.pyw einbauen
-py dev/run_tests.py       # 16 Engine-Testdateien + Ende-zu-Ende-Test + Prüfung, ob die .pyw aktuell ist
+py dev/run_tests.py       # 16 Engine-Testdateien + 2 Ende-zu-Ende-Tests (Hauptfenster, Assistent) + Prüfung, ob die .pyw aktuell ist
 ```
 
 ## Fehlerbehebung
