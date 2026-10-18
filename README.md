@@ -32,7 +32,7 @@ Alle Funktionen sind von hier aus erreichbar:
 | Bereich | Knöpfe |
 |---|---|
 | Kopfzeile | *Öffentlicher Desktop* · *Ordner einbeziehen* · **↻ Neu scannen** · **In Boxen sortieren** |
-| Sortieren | **✦ Mit Claude** (Unklares per KI) · **🌐 Online nachschlagen** · **↶ Rückgängig** |
+| Sortieren | **🔎 Recherche ▾** (Quellen, alles neu prüfen, Zwischenspeicher) · **↶ Rückgängig** |
 | Aufräumen | **📁 Ordner-Assistent ▾** (Dokumente, Downloads, Bilder, Desktop, Videos, anderer Ordner) · **🧹 Downloads** (Tinder-Stil) · **🗑 Papierkorb** |
 | Boxen | **+ Neue Box** · **▦ Anordnen** · **◐ Aus-/Einblenden** · **☰ Mehr ▾** (Ordner-Boxen, Layouts, Einstellungen, regeln.toml, Beenden) |
 
@@ -56,7 +56,30 @@ Ein Klick auf eine Box-Karte zeigt unten ihren Inhalt: neue Objekte zum Verschie
 
 Wer einen Programmordner trotzdem einsortieren oder löschen will, wird vorher gewarnt.
 
-**Online nachschlagen** fragt für unklare Ordner und Verknüpfungen bei **Wikidata/Wikipedia** nach, was hinter dem Namen steckt („Diablo III → Computerspiel → *Spiele*“, „Arduino → Mikrocontroller-Plattform → *Entwicklung*“). Ordner, die online als Software gelten, werden zusätzlich tief nach Programmdateien durchsucht – findet sich eine `.exe`, bleibt der Ordner liegen. Beim ersten Mal wählst du *Immer automatisch* (nach jedem Scan) oder *Nur auf Knopfdruck*; umstellbar unter *☰ Mehr*. Google bietet für solche Abfragen keine freie Schnittstelle; Wikidata ist die offene Wissensdatenbank hinter vielen Suchmaschinen-Infoboxen.
+## Recherche – jede Zuordnung wird gegengeprüft
+
+Bei **jedem Scan** und **vor jedem Sortieren** schlägt Desktop Sorter alle Verknüpfungen, Programme (`.exe`/`.msi`) und Ordner in offenen Quellen nach – parallel, je Server mit Pause zwischen den Anfragen, ohne API-Schlüssel:
+
+| Quelle | Was sie beiträgt |
+|---|---|
+| **Wikidata** (wikidata.org, CC0) | Beschreibung („Computerspiel“, „Webbrowser“) und – falls die nicht reicht – die Aussage *ist ein(e)* (P31) |
+| **Wikipedia** (de/en) | springt ein, wenn Wikidata nichts findet |
+| **Flathub** (flathub.org) | offener App-Katalog mit Standard-Kategorien (Game, Development, Graphics, Network/InstantMessaging …) |
+| **Chocolatey** (community.chocolatey.org) | Windows-Paketverzeichnis der Community: Beschreibung und Schlagwörter |
+
+Die Quellen **stimmen ab**; Spiel und Spiele-Launcher gelten dabei als verwandt:
+
+| Ergebnis | Was passiert |
+|---|---|
+| ✓ **bestätigt** | Recherche sagt dasselbe wie die eigene Erkennung – Tooltip „✓ geprüft (Wikidata, Flathub)“; bei ≥ 2 Quellen steigt die Sicherheit |
+| **ergänzt** | vorher Unklares wird zugeordnet (1 Quelle = mittel, ≥ 2 = hoch) |
+| **Widerspruch** | ≥ 2 Quellen sagen etwas anderes → das Objekt wird **nicht** einsortiert, sondern bleibt mit orangem **?** und Vorschlag zur Entscheidung liegen |
+| **Hinweis** | nur 1 Quelle widerspricht, oder deine eigene Regel / der Ordnerinhalt sagt etwas anderes → deine Zuordnung bleibt, der Hinweis steht im Tooltip |
+| Programmordner | Ordner, die laut Recherche Software sind, werden tief nach Programmdateien durchsucht – findet sich eine `.exe`, bleibt der Ordner liegen |
+
+**In Boxen sortieren** wartet, bis die Recherche fertig ist, und nennt das Prüfergebnis in der Rückfrage. Auch das automatische Einsortieren neuer Verknüpfungen prüft zuerst. Unter dem Titel zeigt eine Zeile den Stand („🔎 Recherche (4 Quellen): 33 bestätigt · 1 ergänzt · …“); der Tooltip jedes Objekts listet die Belege. Im Menü **🔎 Recherche ▾**: Quellen einzeln an/aus, *Alles jetzt neu prüfen*, *Zwischenspeicher leeren*, Recherche ganz aus. Ergebnisse werden 90 Tage zwischengespeichert, der erste Durchgang dauert bei ~80 Objekten etwa 1–2 Minuten, danach Sekunden.
+
+Google bietet für solche Abfragen keine freie Schnittstelle; Wikidata ist die offene Wissensdatenbank hinter vielen Suchmaschinen-Infoboxen.
 
 ## Die Boxen
 
@@ -150,7 +173,7 @@ Jedes Objekt durchläuft diese Stufen; die erste, die greift, entscheidet:
 6. **Dokument-Lexikon** (DE/EN, aus dem Ordner-Assistenten) – *Lebenslauf*, *CV*, *Arbeitszeugnis*, *Mietvertrag*, *Gehaltsabrechnung* … → *Büro & Dokumente* bzw. *Finanzen*
 7. **Ordner** – Programm/Projekt bleibt liegen, sonst nach Inhalt oder Name (siehe oben)
 8. **Dateityp** – nur als Vorschlag; solche Objekte gelten als *unklar*
-9. **Optional online** (Wikidata/Wikipedia) oder **Claude** – ordnen Unklares zu; Claude bevorzugt deine bestehenden Boxen und darf eigene Themen bilden
+9. **Recherche** in Wikidata, Wikipedia, Flathub und Chocolatey – bestätigt, ergänzt oder meldet Widersprüche (siehe oben)
 
 Was zu einer **bestehenden Box** passt, wird auch einzeln dort einsortiert; neue Gruppen entstehen erst ab zwei Objekten.
 
@@ -164,7 +187,7 @@ Erfasst werden beide Desktop-Quellen, die Windows gemeinsam anzeigt: der eigene 
 | `regeln.toml` | eigene Themen; wird beim ersten Start angelegt und ist frei editierbar |
 | `entscheidungen.json` | deine Zuordnungen und gelernten Stichwörter (persönlich, nicht im Repo) |
 | `%USERPROFILE%\DesktopSorter Boxen\` | Inhalt der Boxen (ein Unterordner je Box) + `.boxen.json` (Positionen) |
-| `%USERPROFILE%\.desktop_sorter\` | Journale für „Rückgängig“ (Boxen und Ordner-Assistent) · `online_cache.json` (Online-Ergebnisse, 90 Tage) |
+| `%USERPROFILE%\.desktop_sorter\` | Journale für „Rückgängig“ (Boxen und Ordner-Assistent) · `recherche_cache.json` (Recherche-Ergebnisse, 90 Tage) |
 | `dev/` | Quellcode der Analyse-Engine (`dev/organizer/org_*.py`), Assistenten-Oberfläche, Tests und Build-Skript – nur für die Entwicklung nötig |
 
 Beispiel für `regeln.toml`:
@@ -177,9 +200,9 @@ Beispiel für `regeln.toml`:
 
 ## Datenschutz
 
-Ohne Claude und ohne *Online nachschlagen* läuft alles lokal – auch der Ordner-Assistent liest Dokumente und Fotos ausschließlich auf deinem PC. Mit **Mit Claude** werden nur Anzeigename, Typ und Ziel der unklaren Objekte gesendet – der Benutzerpfad wird dabei durch `%USERPROFILE%` ersetzt, Dateiinhalte werden nie übertragen.
+Dateiinhalte verlassen nie den PC – auch der Ordner-Assistent liest Dokumente und Fotos ausschließlich lokal.
 
-**Online nachschlagen** läuft erst nach deiner Zustimmung und sendet nur den **bereinigten Namen** unklarer Ordner und Verknüpfungen an Wikidata/Wikipedia (z. B. „arduino-1.8.19-windows“ → „arduino“) – nie Pfade, Inhalte oder Namen von Dateien (Dokumentnamen sind oft persönlich). Kryptische Namen (z. B. „ZS_7805 052 430“) werden gar nicht gesendet. Höchstens 40 Namen pro Durchgang, mit Pause zwischen den Anfragen; bei Drosselung (HTTP 429) oder ohne Verbindung wird sofort aufgehört.
+Die **Recherche** (standardmäßig an, abschaltbar unter *🔎 Recherche ▾*) sendet nur den **bereinigten Namen** von Verknüpfungen, Programmen und Ordnern an Wikidata, Wikipedia, Flathub und Chocolatey (z. B. „arduino-1.8.19-windows“ → „arduino“) – nie Pfade, Inhalte oder Namen von Dokumenten (die sind oft persönlich). Kryptische Namen (z. B. „ZS_7805 052 430“) werden gar nicht gesendet, eigene Entscheidungen nicht erneut geprüft. Bremst eine Quelle (HTTP 429) oder ist sie nicht erreichbar, hört nur diese Quelle sofort auf; die Statuszeile meldet es.
 
 ## Bekannte Grenzen
 
@@ -188,8 +211,8 @@ Ohne Claude und ohne *Online nachschlagen* läuft alles lokal – auch der Ordne
 - Unter Windows 10 sind die Ecken der Boxen eckig (runde Fensterecken gibt es erst ab Windows 11).
 - **Explorer-Rechtsklick:** Unter Windows 11 erscheint der Eintrag im klassischen Menü (*Weitere Optionen anzeigen* bzw. Umschalt + Rechtsklick); das neue Kurzmenü erlaubt Einträge nur für installierte App-Pakete.
 - **Ordner-Assistent:** Die Erkennung arbeitet mit Stichwörtern (DE/EN) im Dateinamen und Textanfang, ohne Texterkennung (OCR) – gescannte PDFs ohne Textebene werden nur über den Namen erkannt. Pro Analyse werden höchstens 60 000 Dateien betrachtet, Text ~25 s und Foto-Daten ~60 s lang gelesen; darüber hinaus zählt nur der Dateiname.
-- **Programmordner-Erkennung** ist eine Heuristik: Ein Programm ohne `.exe`/`.dll` in den ersten zwei Ebenen, das nicht in der Registry steht, gilt als Inhaltsordner – im Zweifel *Online nachschlagen* (prüft dann tiefer) oder per Rechtsklick *Auf dem Desktop lassen*. Umgekehrt bleibt ein Inhaltsordner mit einzelner `.exe` lieber liegen.
-- **Online nachschlagen** findet nur, was in Wikidata/Wikipedia steht (Programme, Spiele, Marken); private Projektnamen bleiben unklar.
+- **Programmordner-Erkennung** ist eine Heuristik: Ein Programm ohne `.exe`/`.dll` in den ersten zwei Ebenen, das nicht in der Registry steht, gilt als Inhaltsordner – im Zweifel prüft die Recherche tiefer oder per Rechtsklick *Auf dem Desktop lassen*. Umgekehrt bleibt ein Inhaltsordner mit einzelner `.exe` lieber liegen.
+- Die **Recherche** findet nur, was in den Quellen steht (Programme, Spiele, Marken); private Projektnamen bleiben unklar. Flathub und Chocolatey kennen vor allem Software, Spiele findet vor allem Wikidata. Hinter Firmen-Firewalls oder Proxys kann einzelnes nicht erreichbar sein – das wird angezeigt, sortiert wird dann mit den übrigen Quellen.
 - Die Windows-spezifischen Teile (Registry, Papierkorb-Prüfung, Junctions, OneDrive-Attribute) sind automatisiert, aber nicht auf echtem Windows getestet.
 
 ## Entwicklung

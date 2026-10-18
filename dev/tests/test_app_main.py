@@ -1,5 +1,6 @@
 """End-to-End-Test: Hauptfenster – Unterordner (Programme bleiben liegen), bestehende Boxen
-als Gruppen, Papierkorb, Online-Nachschlagen (gemockt) und Funktionsleiste.
+als Gruppen, Papierkorb, Recherche in offenen Quellen (alle vier Quellen simuliert) und
+Funktionsleiste.
 
     QT_QPA_PLATFORM=offscreen python dev/tests/test_app_main.py [ARBEITSORDNER] [APP.pyw]
 """
@@ -68,14 +69,19 @@ def idle():
     return not getattr(win, "_busy", False) and not (win._worker and win._worker.isRunning())
 
 
+def settled():
+    """Scan und Recherche fertig, nichts wartet mehr."""
+    return idle() and not win.research_running() and not win._apply_pending
+
+
 # ---------- Testdaten ----------
 D, S = N / "Desktop", N / "Boxen"
 for d in (D, S, N / "journal"):
     shutil.rmtree(d, ignore_errors=True)
     d.mkdir(parents=True)
 g.JOURNAL_DIR = N / "journal"
-g.ONLINE_CACHE = N / "journal" / "online_cache.json"
-g.ONLINE_PAUSE = 0
+g.RESEARCH_CACHE = N / "journal" / "recherche_cache.json"
+g.RESEARCH_SOURCES = {k: (v[0], v[1], 0.0, v[3]) for k, v in g.RESEARCH_SOURCES.items()}
 (N / "mem.json").unlink(missing_ok=True)
 
 touch(D / "Diablo III" / ".build.info")                      # Blizzard-Spiel
@@ -99,6 +105,7 @@ touch(D / "Factorio" / "bin" / "x64" / "deep" / "factorio.exe")  # exe tiefer al
 touch(D / "Factorio" / "data" / "base" / "info.json")
 (D / "Hollow Knight.url").write_text("[InternetShortcut]\nURL=steam://rungameid/367520\n")
 touch(D / "Discord.lnk")
+touch(D / "Origin Notes.lnk")            # lokal fälschlich „Origin“ → Launcher; Recherche: Notizen
 touch(D / "Rechnung_2024_03.pdf")
 touch(D / "Notizen.txt")
 touch(D / "Müll.txt")
@@ -119,36 +126,80 @@ ok(roles["Arduino Sketche"] == "project", f"Arduino-Sketche = Projekt ({roles['A
 ok(roles["Visual Studio"] == "project", f"Visual-Studio-Projekte = Projekt ({roles['Visual Studio']})")
 ok(roles["Python Tool"] == "project", f"Git-Repo = Projekt ({roles['Python Tool']})")
 ok(roles["Urlaub Kroatien"] == "content", "Fotoordner = Inhalt")
-ok(roles["Factorio"] == "content", "Factorio (exe sehr tief) zunächst Inhalt – Online-Prüfung klärt")
+ok(roles["Factorio"] == "content", "Factorio (exe sehr tief) zunächst Inhalt – Recherche klärt")
 inst = {os.path.normcase(os.path.normpath(str(D / "Krimskrams")))}
 ok(g.folder_role(D / "Krimskrams", inst)[0] == "program", "Eintrag in der Registry (InstallLocation) = Programm")
 ok(g.online_clean_name("arduino-1.8.19-windows") == "arduino", "Name bereinigen: arduino-1.8.19-windows")
 ok(g.online_clean_name("Diablo III (x86)") == "Diablo III", "Name bereinigen: Diablo III (x86)")
 ok(g.online_clean_name("ZS_7805 052 430") == "", "Kryptische Namen werden nicht gesendet")
+ok(g.research_similar("Arduino IDE v2", "Arduino IDE") and not g.research_similar("Urlaub", "Urlaub Kroatien"),
+   "Namensvergleich: „Arduino IDE v2“ ≈ „Arduino IDE“, „Urlaub“ ≉ „Urlaub Kroatien“")
 
-# ---------- Online-Mock ----------
-ONLINE = {
-    "stardew valley": ("Stardew Valley", "Videospiel von ConcernedApe (2016)"),
-    "factorio": ("Factorio", "Computerspiel von Wube Software"),
-    "diablo iii": ("Diablo III", "Computerspiel von Blizzard Entertainment"),
-    "arduino": ("Arduino", "Hard- und Softwareplattform für Mikrocontroller"),
-}
-QUERIES = []
-MODE = {"m": "ok"}
+# ---------- Simulierte offene Quellen ----------
+WD = {"diablo iii": ("Q1", "Diablo III", "Computerspiel von Blizzard Entertainment"),
+      "stardew valley": ("Q2", "Stardew Valley", "Videospiel von ConcernedApe"),
+      "factorio": ("Q3", "Factorio", "Computerspiel von Wube Software"),
+      "discord": ("Q4", "Discord", "Instant-Messaging-Dienst"),
+      "krimskrams": ("Q7", "Krimskrams", ""),                    # → „ist ein(e)“ (P31)
+      "origin notes": ("Q9", "Origin Notes", "Notizprogramm"),
+      "arduino ide": ("Q10", "Arduino IDE", "integrierte Entwicklungsumgebung")}
+P31 = {"Q7": ["Q500"]}
+LABELS = {"Q500": "Begriff"}
+WIKIPEDIA = {"hollow knight": ("Hollow Knight",
+                               "<span>Hollow Knight</span> ist ein Computerspiel von Team Cherry")}
+FLATHUB = {"discord": ("Discord", "Talk, play, hang out", "network", ["InstantMessaging"]),
+           "stardew valley": ("Stardew Valley", "Farming RPG", "game", []),
+           "origin notes": ("Origin Notes", "Take notes", "office", [])}
+CHOCO = {"discord": ("discord", "Discord", "Discord is a voice and text chat for gamers",
+                     "voip chat gamer gaming")}
+QUERIES = []                             # (Quelle, Suchbegriff)
+MODE = {}                                # Quelle → "limit" | "offline"
+SLOW = {"s": 0.0}
 
 
-def fake_fetch(url):
+def choco_xml(term):
+    hit = CHOCO.get(term.lower())
+    entry = "" if not hit else f"""<entry><title type="text">{hit[0]}</title>
+      <summary type="text">{hit[2]}</summary><m:properties><d:Title>{hit[1]}</d:Title>
+      <d:Tags>{hit[3]}</d:Tags></m:properties></entry>"""
+    return ('<?xml version="1.0" encoding="utf-8"?><feed xmlns="http://www.w3.org/2005/Atom" '
+            'xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices" '
+            'xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">'
+            f'{entry}</feed>')
+
+
+def fake_fetch(url, data=None, raw=False):
+    time.sleep(SLOW["s"])
+    host = urlparse(url).netloc
+    src = ("wikidata" if "wikidata" in host else "wikipedia" if "wikipedia" in host
+           else "flathub" if "flathub" in host else "chocolatey")
     q = parse_qs(urlparse(url).query)
-    term = (q.get("search") or q.get("srsearch"))[0]
-    QUERIES.append(term)
-    if MODE["m"] == "limit":
+    term = (data or {}).get("query") or (q.get("search") or q.get("srsearch") or [""])[0] \
+        or (q.get("searchTerm") or [""])[0].strip("'")
+    if term:
+        QUERIES.append((src, term))
+    if MODE.get(src) == "limit":
         raise HTTPError(url, 429, "Too Many Requests", {}, None)
-    if MODE["m"] == "offline":
+    if MODE.get(src) == "offline":
         raise URLError("offline")
-    hit = ONLINE.get(term.lower())
-    if "wikidata" in url:
-        return {"search": [{"label": hit[0], "description": hit[1]}] if hit else []}
-    return {"query": {"search": []}}
+    if src == "wikidata":
+        if "wbsearchentities" in url:
+            hit = WD.get(term.lower())
+            return {"search": [{"id": hit[0], "label": hit[1], "description": hit[2]}] if hit else []}
+        if "wbgetclaims" in url:
+            ent = q["entity"][0]
+            return {"claims": {"P31": [{"mainsnak": {"datavalue": {"value": {"id": i}}}}
+                                       for i in P31.get(ent, [])]}}
+        ids = q["ids"][0].split("|")
+        return {"entities": {i: {"labels": {"de": {"value": LABELS.get(i, "")}}} for i in ids}}
+    if src == "wikipedia":
+        hit = WIKIPEDIA.get(term.lower())
+        return {"query": {"search": [{"title": hit[0], "snippet": hit[1]}] if hit else []}}
+    if src == "flathub":
+        hit = FLATHUB.get(term.lower())
+        return {"hits": [{"name": hit[0], "summary": hit[1], "main_categories": hit[2],
+                          "sub_categories": hit[3], "app_id": "x"}] if hit else []}
+    return choco_xml(term)
 
 
 g._online_fetch = fake_fetch
@@ -157,8 +208,7 @@ g._online_fetch = fake_fetch
 print("Hauptfenster:")
 fm = g.FenceManager(S)
 fm.sync()
-args = argparse.Namespace(desktop=D, rules=None, memory=N / "mem.json", model="x", min_group=2,
-                          storage=S)
+args = argparse.Namespace(desktop=D, rules=None, memory=N / "mem.json", min_group=2, storage=S)
 CONFIRMS, MESSAGES = [], []
 ANSWERS = []
 g.MainWindow.confirm = lambda self, title, text: (CONFIRMS.append((title, text)),
@@ -167,8 +217,10 @@ g.MainWindow.message = lambda self, title, text, warn=False: MESSAGES.append((ti
 win = g.MainWindow(args, fm)
 win.resize(1320, 860)
 win.show()
-ok(wait(lambda: win.items and idle()), "Scan fertig")
+ok(wait(lambda: win.items and settled() and win.research_results, 30), "Scan und Recherche fertig")
 ok(win.t_folders.isChecked(), "„Ordner einbeziehen“ ist standardmäßig an")
+ok(not hasattr(win, "b_ai") and not hasattr(win, "run_ai"), "Claude-Knopf ist entfernt")
+ok(g.research_settings(fm.cfg) == (True, list(g.RESEARCH_SOURCES)), "Recherche standardmäßig an, alle Quellen")
 
 
 def item(name):
@@ -187,24 +239,80 @@ for n in ("Arduino Sketche", "Visual Studio", "Python Tool"):
     ok(it.role == "project" and it.confidence == "keep", f"{n}: Projekt bleibt liegen ({it.reason})")
 ok(item("Urlaub Kroatien").category == "Bilder & Grafik", f"Urlaub Kroatien → Bilder & Grafik ({item('Urlaub Kroatien').reason})")
 ok(item("Bewerbung 2024").category == "Büro & Dokumente", f"Bewerbung 2024 → Büro & Dokumente ({item('Bewerbung 2024').reason})")
-ok(item("Krimskrams").confidence == "low", "Krimskrams bleibt unklar")
 ok(item("Rechnung_2024_03.pdf").category == "Finanzen", "PDF-Rechnung → Finanzen (Thema vor Dateityp)")
 ok(item("Lebenslauf Felix.pdf").category == "Büro & Dokumente"
    and "Lebenslauf" in item("Lebenslauf Felix.pdf").reason, "Lebenslauf über das Dokument-Lexikon erkannt")
 
+# ---------- Recherche ----------
+print("Recherche:")
+dc, hk, sv = item("Discord"), item("Hollow Knight"), item("Stardew Valley")
+fa, di, kk, on_ = item("Factorio"), item("Diablo III"), item("Krimskrams"), item("Origin Notes")
+ok(dc.check == "confirmed" and "✓ geprüft (Wikidata, Flathub, Chocolatey)" in dc.reason,
+   f"Discord: von 3 Quellen bestätigt ({dc.reason})")
+ok(hk.check == "confirmed" and "Wikipedia" in hk.reason, f"Hollow Knight: Wikipedia springt ein ({hk.reason})")
+ok(sv.category == "Spiele" and sv.confidence == "high" and sv.check == "corrected",
+   f"Stardew Valley: unklar → Spiele, 2 Quellen ({sv.reason})")
+ok(fa.role == "program" and fa.confidence == "keep",
+   f"Factorio: Spiel laut Recherche + exe gefunden → bleibt liegen ({fa.reason})")
+ok(di.confidence == "keep" and "Computerspiel" in di.reason, "Diablo III: nur Info, bleibt liegen")
+ok(kk.confidence == "low" and "Begriff" in kk.reason, f"Krimskrams: „ist ein“ (P31) abgefragt, bleibt unklar ({kk.reason})")
+ok(on_.confidence == "low" and on_.category == "Büro & Dokumente" and on_.check == "conflict",
+   f"Origin Notes: Widerspruch → zur Prüfung, Vorschlag Büro ({on_.reason})")
+sent = {t.lower() for _s, t in QUERIES}
+ok(not sent & {"notizen", "lebenslauf felix", "rechnung 2024 03", "müll", "rechnung_2024_03"},
+   "Keine Dokumentnamen gesendet")
+ok({"discord", "stardew valley", "diablo iii", "factorio"} <= sent, "Verknüpfungen, Programme und Ordner geprüft")
+ok(not any(s == "wikipedia" and t.lower() == "discord" for s, t in QUERIES),
+   "Wikipedia nur, wenn Wikidata nichts findet")
+label = win.research_label.text()
+ok("bestätigt" in label and "1 Widerspruch " in label, f"Statuszeile: {label}")
+tips = {win.desk_list.item(r).text(): win.desk_list.item(r).toolTip() for r in range(win.desk_list.count())}
+ok("Bitte prüfen" in tips.get("Origin Notes", "") and "Flathub" in tips.get("Origin Notes", ""),
+   "Tooltip zeigt Widerspruch und Belege")
+cache = json.loads(g.RESEARCH_CACHE.read_text(encoding="utf-8"))
+ok("discord" in cache.get("flathub", {}) and "Q500" in cache.get("_labels", {}), "Ergebnisse im Zwischenspeicher")
+n_q = len(QUERIES)
+win.rescan()
+ok(wait(settled, 15), "Neu-Scan fertig")
+ok(len(QUERIES) == n_q and item("Stardew Valley").category == "Spiele",
+   "Neu-Scan nutzt die bekannten Ergebnisse – keine neue Anfrage")
+res, status = g.research_run([g.Item(D / "Stardew Valley", "user", "folder")], cache, fake_fetch)
+ok(len(QUERIES) == n_q and res[str(D / "Stardew Valley")]["confirmed"] == 2, "Zweiter Lauf aus dem Zwischenspeicher")
+MODE.update(wikidata="limit")
+res, status = g.research_run([g.Item(D / "Werkzeug Eins", "user", "folder"),
+                              g.Item(D / "Werkzeug Zwei", "user", "folder")], {}, fake_fetch)
+ok(status["wikidata"] == "limit" and status["flathub"] == "ok"
+   and sum(s == "wikidata" for s, _ in QUERIES[n_q:]) == 1, "HTTP 429 → nur diese Quelle hört auf")
+MODE.clear()
+MODE.update({k: "offline" for k in g.RESEARCH_SOURCES})
+t0 = time.time()
+res, status = g.research_run([g.Item(D / f"Werkzeug {i}", "user", "folder") for i in "ABCDEF"],
+                             {}, fake_fetch)
+ok(set(status.values()) == {"offline"} and time.time() - t0 < 2, "Offline → sofort aufhören")
+ok("nicht erreichbar" in g.research_status_text(status), "Offline wird gemeldet")
+MODE.clear()
 groups, left = win.plan()
-ok("Spiele" in groups and [i.label for i in groups["Spiele"]] == ["Hollow Knight"],
-   "Einzelnes Spiel landet in der bestehenden Box „Spiele“")
+ok("Spiele" in groups and {i.label for i in groups["Spiele"]} == {"Hollow Knight", "Stardew Valley"},
+   "Spiele-Box: Hollow Knight + Stardew Valley (Recherche)")
 ok("Kommunikation" in groups, "Discord landet in der bestehenden Box „Kommunikation“")
-ok("Bilder & Grafik" in groups and len(groups["Bilder & Grafik"]) == 2, "Zwei Fotoordner bilden eine Gruppe")
-ok(all(i.label not in ("Diablo III", "Arduino IDE") for gr in groups.values() for i in gr),
-   "Programmordner sind in keiner Gruppe")
+ok(all(i.label != "Origin Notes" for gr in groups.values() for i in gr), "Widerspruch wird nicht einsortiert")
+win.reset_research(False, list(g.RESEARCH_SOURCES))
+ok(wait(settled, 15) and "Recherche aus" in win.research_label.text()
+   and item("Origin Notes").category == "Spiele-Launcher & Tools", "Recherche abschaltbar → nur lokal")
+win.reset_research(True, ["wikidata", "chocolatey"])
+ok(wait(lambda: settled() and win.research_results, 15) and "Flathub" not in win.research_label.toolTip()
+   and "Chocolatey" in win.research_label.toolTip()
+   and item("Discord").check == "confirmed", "Einzelne Quelle abschaltbar")
+win.reset_research(True, list(g.RESEARCH_SOURCES))
+ok(wait(lambda: settled() and win.research_results, 15), "Wieder alle Quellen")
 
+# ---------- Boxen & Zuordnung ----------
+print("Boxen:")
 cards = win.grid.cards
 names = [c.name for c in cards]
 ok("Werkzeuge" in names, "Leere bestehende Box „Werkzeuge“ wird immer als Karte gezeigt")
 spiele = next(c for c in cards if c.name == "Spiele")
-ok(spiele.box_count == 1 and spiele.count == 1, "Karte „Spiele“: 1 in der Box, +1 neu")
+ok(spiele.box_count == 1 and spiele.count == 2, "Karte „Spiele“: 1 in der Box, +2 neu")
 ok(next(c for c in cards if c.name == "Werkzeuge").box_count == 0, "Karte „Werkzeuge“: leer")
 ok(cards[-2].new and cards[-1].trash, "Am Ende: „+ Neue Gruppe“ und „Papierkorb“")
 ok("Programmordner" in win.desk_sub.text(), f"Desktop-Liste zählt Programmordner ({win.desk_sub.text()})")
@@ -222,19 +330,17 @@ ok(win.selected == "Werkzeuge" and "in der Box" in win.detail_title.text(),
    "Leere Box auswählbar – Ziel für Drag & Drop")
 win.select_group("Werkzeuge")
 
-# Programmordner in eine Gruppe ziehen → Rückfrage
 ANSWERS[:] = [False]
 win.assign([idx("Diablo III")], "Spiele")
 win.refresh()
 ok(CONFIRMS and "Programmordner" in CONFIRMS[-1][0], "Rückfrage beim Verschieben eines Programmordners")
 ok(item("Diablo III").confidence == "keep", "„Nein“ → Diablo III bleibt liegen")
-ANSWERS[:] = [True]
+n_conf = len(CONFIRMS)
 win.assign([idx("Notizen.txt")], "Werkzeuge")
 QApplication.processEvents()
 win.refresh()
 ok(item("Notizen.txt").category == "Werkzeuge", "Zuordnung zu leerer Box „Werkzeuge“")
-ok(len(CONFIRMS) == 1, "Keine Rückfrage für normale Dateien")
-ok("Werkzeuge" in win.plan()[0], "„Werkzeuge“ hat jetzt ein neues Objekt")
+ok(len(CONFIRMS) == n_conf, "Keine Rückfrage für normale Dateien")
 
 # ---------- Papierkorb ----------
 print("Papierkorb:")
@@ -249,16 +355,14 @@ ok("Wirkt wichtig" in CONFIRMS[-1][1] and "Lebenslauf" in CONFIRMS[-1][1], "Warn
 ok((D / "Lebenslauf Felix.pdf").exists(), "Lebenslauf bleibt")
 CONFIRMS.clear()
 ANSWERS[:] = [True]
-trash_card = win.grid.cards[-1]
-trash_card.dropped.emit("", [idx("Müll.txt")])                 # Drop auf die Papierkorb-Karte
+win.grid.cards[-1].dropped.emit("", [idx("Müll.txt")])        # Drop auf die Papierkorb-Karte
 ok(wait(lambda: not (D / "Müll.txt").exists(), 5), "Drop auf „Papierkorb“ → Datei im Papierkorb")
 ok(CONFIRMS and "Wirkt wichtig" not in CONFIRMS[-1][1], "Normale Datei ohne Warnung")
-ok(wait(lambda: win.items and idle()
-        and all(it.label != "Müll.txt" for it in win.items)), "Nach dem Löschen neu gescannt")
-# Entf-Taste in der Desktop-Liste
+ok(wait(lambda: win.items and settled() and all(it.label != "Müll.txt" for it in win.items)),
+   "Nach dem Löschen neu gescannt")
 touch(D / "Alt.tmp")
 win.rescan()
-wait(lambda: idle() and any(i.label == "Alt.tmp" for i in win.items))
+wait(lambda: settled() and any(i.label == "Alt.tmp" for i in win.items))
 for r in range(win.desk_list.count()):
     li = win.desk_list.item(r)
     li.setSelected(li.text() == "Alt.tmp")
@@ -267,57 +371,22 @@ from PySide6.QtGui import QKeyEvent
 from PySide6.QtCore import QEvent
 QApplication.sendEvent(win.desk_list, QKeyEvent(QEvent.KeyPress, Qt.Key_Delete, Qt.NoModifier))
 ok(wait(lambda: not (D / "Alt.tmp").exists(), 5), "Entf-Taste → Papierkorb")
-wait(idle)
-
-# ---------- Online nachschlagen ----------
-print("Online nachschlagen:")
-cands = [i.label for i in g.online_candidates(win.items)]
-ok("Stardew Valley" in cands and "Factorio" in cands, f"Kandidaten: unklare Ordner ({cands})")
-ok(not any(c.endswith((".pdf", ".txt")) for c in cands), "Dateien werden nie gesendet")
-ok(cands.index("Diablo III") > cands.index("Stardew Valley"), "Programmordner nur danach (Info)")
-win._set_online_mode("manual")
-win.online_lookup()
-ok(wait(lambda: win._online and not win._online.is_running() and "Online" in win.subtitle.text(), 15),
-   f"Nachschlagen fertig ({win.subtitle.text()})")
-sv, fa, di = item("Stardew Valley"), item("Factorio"), item("Diablo III")
-ok(sv.category == "Spiele" and sv.confidence == "medium", f"Stardew Valley → Spiele ({sv.reason})")
-ok(fa.role == "program" and fa.confidence == "keep", f"Factorio: online Spiel + exe gefunden → bleibt liegen ({fa.reason})")
-ok("Online:" in di.reason and di.confidence == "keep", "Diablo III: nur Info, bleibt liegen")
-ok(item("Krimskrams").confidence == "low", "Krimskrams: nichts gefunden → bleibt unklar")
-ok(all(q.lower() not in ("notizen", "lebenslauf felix") for q in QUERIES), "Keine Dokumentnamen gesendet")
-cache = json.loads(g.ONLINE_CACHE.read_text(encoding="utf-8"))
-ok("stardew valley" in cache, "Ergebnisse im Cache")
-n_q = len(QUERIES)
-win.rescan()
-wait(idle)
-ok(item("Stardew Valley").category == "Spiele", "Ergebnis übersteht Neu-Scan")
-res, why = g.online_resolve([item("Stardew Valley")], cache, fake_fetch)
-ok(len(QUERIES) == n_q and res, "Zweiter Durchgang aus dem Cache – keine neue Anfrage")
-MODE["m"] = "limit"
-res, why = g.online_resolve([g.Item(D / "Neu Eins", "user", "folder"),
-                             g.Item(D / "Neu Zwei", "user", "folder")], {}, fake_fetch)
-ok(why == "limit" and len(QUERIES) == n_q + 1, "HTTP 429 → sofort aufhören")
-MODE["m"] = "offline"
-t0 = time.time()
-res, why = g.online_resolve([g.Item(D / "Neu Eins", "user", "folder"),
-                             g.Item(D / "Neu Zwei", "user", "folder")], {}, fake_fetch)
-ok(why == "offline" and time.time() - t0 < 2, "Offline → sofort aufhören")
-MODE["m"] = "ok"
+wait(settled)
 
 # ---------- Funktionsleiste ----------
 print("Funktionsleiste:")
-for b in (win.b_org, win.b_clean, win.b_newbox, win.b_arrange, win.b_vis, win.b_more, win.b_trash,
-          win.b_online, win.b_ai, win.b_undo):
+for b in (win.b_research, win.b_undo, win.b_org, win.b_clean, win.b_trash, win.b_newbox,
+          win.b_arrange, win.b_vis, win.b_more):
     ok(b.isEnabled(), f"„{b.text()}“ aktiv")
 win.toggle_boxes()
 ok(not fm.visible and "Einblenden" in win.b_vis.text(), "Boxen ausblenden")
 win.toggle_boxes()
 ok(fm.visible and "Ausblenden" in win.b_vis.text(), "Boxen einblenden")
-for show in (win.show_more_menu, win.show_organizer_menu):
+for show in (win.show_research_menu, win.show_more_menu, win.show_organizer_menu):
     QTimer.singleShot(150, lambda: QApplication.activePopupWidget()
                       and QApplication.activePopupWidget().close())
     show()
-ok(True, "Menüs „Mehr“ und „Ordner-Assistent“ öffnen ohne Fehler")
+ok(True, "Menüs „Recherche“, „Mehr“ und „Ordner-Assistent“ öffnen ohne Fehler")
 g.ask_box_name = lambda title, text: "Games"
 win.select_group("Spiele")
 win.rename_box("Spiele")
@@ -335,21 +404,44 @@ if os.environ.get("DS_SHOT"):
     QApplication.processEvents()
     win.grab().save(os.environ["DS_SHOT"])
 
-# ---------- Sortieren & Rückgängig ----------
+# ---------- Sortieren wartet auf die Recherche ----------
 print("Sortieren:")
+SLOW["s"] = 0.02
+CONFIRMS.clear()
 ANSWERS[:] = [True]
-win.apply()
+win.start_research(force=True)                  # alles neu prüfen (ohne Zwischenspeicher)
+win.apply()                                     # … währenddessen sortieren
+ok(win._apply_pending and not CONFIRMS, "„In Boxen sortieren“ wartet, bis alles geprüft ist")
+ok(wait(lambda: CONFIRMS and settled(), 60), "Danach automatisch sortiert")
+SLOW["s"] = 0.0
+ok(CONFIRMS and "Geprüft mit Wikidata, Wikipedia, Flathub, Chocolatey" in CONFIRMS[0][1],
+   "Bestätigung nennt das Prüfergebnis")
 ok((S / "Games" / "Hollow Knight.url").exists(), "Hollow Knight in Box „Games“")
+ok((S / "Games" / "Stardew Valley").is_dir(), "Stardew Valley (recherchiert) in „Games“ (umbenannte Box)")
 ok((S / "Kommunikation" / "Discord.lnk").exists(), "Discord in Box „Kommunikation“")
 ok((S / "Bilder & Grafik" / "Urlaub Kroatien").is_dir(), "Fotoordner in „Bilder & Grafik“")
 ok((S / "Werkzeuge" / "Notizen.txt").exists(), "Notizen in leerer Box „Werkzeuge“")
-ok((S / "Games" / "Stardew Valley").is_dir(), "Stardew Valley (online erkannt) in „Games“")
+ok((D / "Origin Notes.lnk").exists(), "Widerspruch bleibt zur Prüfung auf dem Desktop")
 for n in ("Diablo III", "Arduino IDE", "Arduino Sketche", "Visual Studio", "Python Tool", "Factorio"):
     ok((D / n).is_dir(), f"{n} liegt noch auf dem Desktop")
-wait(idle)
+wait(settled)
 ANSWERS[:] = [True]
 win.undo()
 ok((D / "Hollow Knight.url").exists() and (D / "Urlaub Kroatien").is_dir(), "Rückgängig")
+wait(settled)
+
+# ---------- Automatisch einsortieren prüft mit ----------
+print("Automatisch einsortieren:")
+fm.desktops = [D]
+fm.desk_known = set(fm._desktop_names())
+touch(D / "Origin Notes Kopie.lnk")
+touch(D / "Discord PTB.lnk")
+WD["discord ptb"] = WD["discord"]
+FLATHUB["discord ptb"] = FLATHUB["discord"]
+fm._autosort()
+ok(wait(lambda: not (fm._worker and fm._worker.isRunning()) and not (D / "Discord PTB.lnk").exists(), 15),
+   "Neue Verknüpfung: geprüft und in „Kommunikation“ einsortiert")
+ok((D / "Origin Notes Kopie.lnk").exists(), "Neue Verknüpfung mit Widerspruch bleibt liegen")
 
 win.close()
 fails = RESULTS.count(False)

@@ -4,7 +4,7 @@ DesktopSorter.pyw — sortiert Windows-Desktop-Symbole thematisch in Gruppen
 (wie die iOS-App-Mediathek), mit Liquid-Glass-Oberfläche. Eine einzige Datei.
 
 Einmalig installieren (PowerShell):
-    py -m pip install PySide6 PySideSix-Frameless-Window anthropic
+    py -m pip install PySide6 PySideSix-Frameless-Window
 
 Starten: Doppelklick auf DesktopSorter.pyw   (oder: py DesktopSorter.pyw)
 
@@ -21,9 +21,11 @@ Bedienung
     Vorschlag. Bestehende Boxen (▣) sind immer als Karte da.
   • Unterordner werden mit einsortiert; Programm-, Spiel- und Projektordner (⚙)
     bleiben liegen, damit sie weiter funktionieren.
+  • Recherche: Jede Zuordnung wird in offenen Quellen gegengeprüft (Wikidata,
+    Wikipedia, Flathub, Chocolatey) – bei jedem Scan und vor dem Sortieren.
+    Widersprüche bleiben als „?“ zur Entscheidung liegen.
   • „In Boxen sortieren“ verschiebt erst nach Bestätigung; „Rückgängig“ macht es
-    komplett rückgängig. „Mit Claude“ (API-Schlüssel) und „Online nachschlagen“
-    (Wikidata/Wikipedia, nach Zustimmung) ordnen Unklares zu.
+    komplett rückgängig.
   • Die Leiste darunter erreicht alles Weitere: Ordner-Assistent, Downloads
     aufräumen, Papierkorb, neue Box, Boxen anordnen/ausblenden, Einstellungen.
 """
@@ -41,6 +43,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -235,6 +238,7 @@ class Item:
     reason: str = "keine Regel"
     confidence: str = "low"
     role: str = ""                # Ordner: program | project | content | empty
+    check: str = ""               # Ergebnis der Recherche (confirmed, corrected, conflict …)
 
     @property
     def label(self) -> str:       # wie auf dem Desktop angezeigt
@@ -516,52 +520,86 @@ def folder_has_binaries(path: Path, limit: int = 5000) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Online nachschlagen (Wikidata / Wikipedia, ohne Schlüssel) – nur auf Wunsch
+# Recherche in offenen Quellen – prüft jede Zuordnung gegen (ohne API-Schlüssel)
 # --------------------------------------------------------------------------- #
-ONLINE_UA = "DesktopSorter/1.0 (https://github.com/FelixKucher/Desktop-Sorter)"
-ONLINE_CACHE = JOURNAL_DIR / "online_cache.json"
-ONLINE_MAX = 40                  # höchstens so viele Namen pro Durchgang
-ONLINE_PAUSE = 0.5               # Sekunden zwischen Anfragen (Wikimedia-Rate-Limit)
+RESEARCH_UA = "DesktopSorter/1.0 (https://github.com/FelixKucher/Desktop-Sorter)"
+RESEARCH_CACHE = JOURNAL_DIR / "recherche_cache.json"
+RESEARCH_CACHE_DAYS = 90         # Treffer so lange merken …
+RESEARCH_MISS_DAYS = 30          # … „nichts gefunden“ kürzer
+RESEARCH_MAX = 250               # höchstens so viele Namen pro Durchgang
+RESEARCH_LEAVE = ("program", "project")
+RESEARCH_EXE = {".exe", ".msi"}
+# Schlüssel → (Anzeigename, Server, Pause zwischen Anfragen in s, Bedeutung)
+RESEARCH_SOURCES: dict[str, tuple[str, str, float, str]] = {
+    "wikidata": ("Wikidata", "wikidata.org", 0.5,
+                 "freie Wissensdatenbank (CC0): Beschreibung und „ist ein(e)“, z. B. Computerspiel"),
+    "wikipedia": ("Wikipedia", "wikipedia.org", 0.5,
+                  "Enzyklopädie DE/EN – springt ein, wenn Wikidata nichts findet"),
+    "flathub": ("Flathub", "flathub.org", 0.2,
+                "offener App-Katalog mit Standard-Kategorien (Spiel, Entwicklung, Grafik …)"),
+    "chocolatey": ("Chocolatey", "community.chocolatey.org", 0.3,
+                   "Windows-Paketverzeichnis der Community: Programme und Schlagwörter"),
+}
+GAMING = {"Spiele", "Spiele-Launcher & Tools"}       # gelten untereinander als Übereinstimmung
 ONLINE_RULES: list[tuple[str, str]] = [
     ("Spiele-Launcher & Tools", r"spieleplattform|vertriebsplattform|distribution platform|"
                                 r"digital distribution|game launcher|launcher|mod manager|"
-                                r"game client|modding"),
-    ("Entwicklung", r"entwicklungsumgebung|\bide\b|quelltext-?editor|source[- ]code editor|"
-                    r"code editor|programmiersprache|programming language|compiler|"
-                    r"versionsverwaltung|version control|software development|"
-                    r"softwareentwicklung|hard- und softwareplattform|mikrocontroller|"
-                    r"microcontroller|open hardware|open-source hardware|electronics platform|"
-                    r"virtualisierung|virtual machine|hypervisor|\bsdk\b|framework|"
-                    r"spiel-?engine|game engine"),
-    ("Spiele", r"computerspiel|videospiel|\bspiel\b|video ?game|\bgame\b|mmorpg|rollenspiel|"
+                                r"game client|spiele-?client|game store|modding"),
+    ("Entwicklung", r"entwicklungsumgebung|integrated development|\bide\b|quelltext-?editor|"
+                    r"source[- ]code editor|code editor|programmiersprache|programming|"
+                    r"programmierung|compiler|debugger|versionsverwaltung|version control|"
+                    r"software development|softwareentwicklung|hard- und softwareplattform|"
+                    r"mikrocontroller|microcontroller|open hardware|open-source hardware|"
+                    r"electronics platform|virtualisierung|virtual machine|hypervisor|\bsdk\b|"
+                    r"framework|spiel-?engine|game engine"),
+    ("Spiele", r"computerspiel|videospiel|\bspiel\b|video ?game|\bgames?\b|mmorpg|rollenspiel|"
                r"shooter|strategiespiel|battle royale|simulationsspiel|downloadable content|"
                r"game expansion|erweiterung .*spiel"),
-    ("3D-Druck & CAD", r"\bcad\b|slicer|3d-druck|3d printing|3d-modell|3d model|"
-                       r"computer-aided design|rechnergestützt"),
-    ("Kommunikation", r"messenger|instant messaging|\bvoip\b|\bchat|videokonferenz|"
-                      r"video conferenc|e-mail-programm|email client|e-mail client"),
+    ("3D-Druck & CAD", r"\bcad\b|slicer|3d-druck|3d printing|3d-modell|3d model|3d-grafik|"
+                       r"3d graphics|3d computer graphics|computer-aided design|rechnergestützt"),
+    ("Kommunikation", r"messenger|instant[- ]messaging|\bvoip\b|\bchat|videokonferenz|"
+                      r"video ?conferenc|e-mail-programm|e-?mail[- ]client|telefonie|"
+                      r"kommunikationsdienst|collaboration platform"),
     ("Browser & Internet", r"webbrowser|web browser|\bbrowser\b|\bftp\b|\bvpn\b|"
                            r"download-?manager|passwort-?manager|password manager"),
-    ("Büro & Dokumente", r"office|textverarbeitung|word processor|tabellenkalkulation|"
-                         r"spreadsheet|\bpdf\b|präsentationsprogramm|presentation program|"
-                         r"notiz|note-taking"),
+    ("Büro & Dokumente", r"\boffice\b|bürosoftware|textverarbeitung|word processor|"
+                         r"tabellenkalkulation|spreadsheet|\bpdf\b|präsentationsprogramm|"
+                         r"presentation program|notiz|note-taking"),
     ("Bilder & Grafik", r"bildbearbeitung|image editor|raster graphics|grafiksoftware|"
-                        r"vektorgrafik|vector graphics|fotobearbeitung|photo editing"),
+                        r"vektorgrafik|vector graphics|fotobearbeitung|photo editing|"
+                        r"image manipulation"),
     ("Musik & Video", r"mediaplayer|media player|musik-?streaming|music streaming|"
                       r"videobearbeitung|video editing|audio editor|streaming"),
     ("Hardware & Peripherie", r"treiber|\bdriver|peripher|\brgb\b|mainboard|motherboard|"
-                              r"\bmaus\b|\bmouse\b|tastatur|keyboard|drucker|printer|"
+                              r"\bmaus\b|\bmouse\b|\bmice\b|tastatur|keyboard|drucker|printer|"
                               r"grafikkarte|graphics card"),
-    ("System & Datenträger", r"dienstprogramm|utility|antivir|backup|partition|"
+    ("System & Datenträger", r"dienstprogramm|\butilit|antivir|backup|partition|"
                              r"disk imag|datenträger|betriebssystem|operating system|"
                              r"systemprogramm|system software"),
 ]
+FLATHUB_MAIN = {"game": "Spiele", "development": "Entwicklung", "graphics": "Bilder & Grafik",
+                "audiovideo": "Musik & Video", "office": "Büro & Dokumente",
+                "network": "Browser & Internet", "utility": "System & Datenträger",
+                "system": "System & Datenträger"}
+FLATHUB_SUB = {"InstantMessaging": "Kommunikation", "Chat": "Kommunikation",
+               "VideoConference": "Kommunikation", "Email": "Kommunikation",
+               "IRCClient": "Kommunikation", "Telephony": "Kommunikation",
+               "WebBrowser": "Browser & Internet", "FileTransfer": "Browser & Internet",
+               "3DGraphics": "3D-Druck & CAD", "Engineering": "3D-Druck & CAD",
+               "IDE": "Entwicklung", "Debugger": "Entwicklung", "RevisionControl": "Entwicklung",
+               "HardwareSettings": "Hardware & Peripherie", "Printing": "Hardware & Peripherie",
+               "Emulator": "Spiele-Launcher & Tools", "PackageManager": "Spiele-Launcher & Tools"}
+_RESEARCH_LOCK = threading.Lock()
+
+
+class OnlineRateLimited(Exception):
+    """HTTP 429 – die Quelle bremst; für diesen Durchgang aufhören."""
 
 
 def online_clean_name(name: str) -> str:
     """„arduino-1.8.19-windows“ → „arduino“; „Diablo III (x86)“ → „Diablo III“.
     Leer, wenn nichts Nachschlagbares übrig bleibt (z. B. „ZS_7805 052 430“)."""
-    s = re.sub(r"\.(lnk|url|exe|zip)$", "", name, flags=re.I)
+    s = re.sub(r"\.(lnk|url|exe|msi|zip)$", "", name, flags=re.I)
     s = re.sub(r"\(.*?\)|\[.*?\]", " ", s)
     s = re.sub(r"[_\-.]+", " ", s)
     s = re.sub(r"\b(v?\d+(\s\d+)*|x64|x86|win(32|64)?|windows|setup|installer|portable|"
@@ -579,249 +617,421 @@ def online_category(text: str) -> str:
     return ""
 
 
-def _online_fetch(url: str) -> dict:
+def research_family(cat: str) -> str:
+    return "gaming" if cat in GAMING else cat
+
+
+def _research_norm(s: str) -> str:
+    return re.sub(r"[\W_]+", "", (s or "").casefold())
+
+
+RESEARCH_MIN_COVER = 0.6         # Verknüpfungen: „Arduino IDE v2“ ≈ „Arduino IDE“ …
+RESEARCH_MIN_COVER_FOLDER = 0.8  # … Ordner fast nur bei gleichem Namen („Scans“ ≠ „scanservjs“)
+
+
+def research_cover(label: str, query: str) -> float:
+    """1.0 = gleicher Name; sonst Anteil, wenn einer mit dem anderen beginnt; sonst 0."""
+    a, b = _research_norm(label), _research_norm(query)
+    if not a or not b:
+        return 0.0
+    short, long_ = sorted((a, b), key=len)
+    return len(short) / len(long_) if long_.startswith(short) else 0.0
+
+
+def research_similar(label: str, query: str) -> bool:
+    """„Arduino IDE v2“ ≈ „Arduino IDE“, aber „Urlaub“ ≉ „Urlaub Kroatien“."""
+    return research_cover(label, query) >= RESEARCH_MIN_COVER
+
+
+def _research_best(hits: list, query: str, names) -> list:
+    """[(Abdeckung, Treffer)] mit ausreichend ähnlichem Namen, genaueste zuerst (stabil).
+    names(Treffer) liefert die Namen, unter denen der Treffer passen darf."""
+    scored = []
+    for h in hits:
+        cover = max((research_cover(n, query) for n in names(h)), default=0.0)
+        if cover >= RESEARCH_MIN_COVER:
+            scored.append((cover, h))
+    return sorted(scored, key=lambda x: -x[0])
+
+
+def _online_fetch(url: str, data: dict | None = None, raw: bool = False):
+    """GET (oder POST mit JSON) → JSON bzw. Text; höchstens 2 MB."""
     import urllib.request
-    req = urllib.request.Request(url, headers={"User-Agent": ONLINE_UA})
+    headers = {"User-Agent": RESEARCH_UA,
+               "Accept": "application/atom+xml" if raw else "application/json"}
+    body = None
+    if data is not None:
+        body = json.dumps(data).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=headers)
     with urllib.request.urlopen(req, timeout=8) as r:   # noqa: S310 — feste https-URLs
-        return json.loads(r.read().decode("utf-8", "replace"))
+        text = r.read(2_000_000).decode("utf-8", "replace")
+    return text if raw else json.loads(text)
 
 
-class OnlineRateLimited(Exception):
-    pass
+def _research_disambiguation(text: str) -> bool:
+    return bool(re.search(r"begriffskl|disambiguation|wikimedia-liste|wikimedia list", text, re.I))
 
 
-class OnlineUnavailable(Exception):
-    """Keine einzige Anfrage kam durch (offline, Proxy, Firewall)."""
-
-
-def online_lookup(name: str, fetch=None) -> dict:
-    """Was ist „name“? → {"query", "label", "description", "category", "source"}.
-    Wikidata (de, dann en), sonst Wikipedia-Suche. Wirft OnlineRateLimited bei HTTP 429
-    und OnlineUnavailable, wenn keine Anfrage durchkam."""
-    from urllib.error import HTTPError, URLError
+def research_wikidata(q: str, fetch, labels: dict) -> dict | None:
+    """Suche (de, dann en). Ohne verwertbare Beschreibung zusätzlich „ist ein(e)“ (P31)."""
     from urllib.parse import quote
-    fetch = fetch or _online_fetch
-    q = online_clean_name(name)
-    res = {"query": q, "label": "", "description": "", "category": "", "source": ""}
-    if not q:
-        return res
-    norm = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
+    api = "https://www.wikidata.org/w/api.php"
+    for lang in ("de", "en"):
+        data = fetch(f"{api}?action=wbsearchentities&search={quote(q)}&language={lang}"
+                     f"&uselang={lang}&type=item&format=json&limit=7")
+        raw = [h for h in (data.get("search", []) if isinstance(data, dict) else [])
+               if not _research_disambiguation(h.get("description", ""))]
+        hits = _research_best(raw, q, lambda h: (h.get("label", ""),
+                                                 (h.get("match") or {}).get("text", "")))
+        if not hits:
+            continue
+        for cover, h in hits:                            # genauester Treffer mit Kategorie
+            cat = online_category(h.get("description", ""))
+            if cat:
+                return {"source": "Wikidata", "label": h.get("label", ""),
+                        "text": h.get("description", ""), "category": cat, "cover": cover,
+                        "url": f"https://www.wikidata.org/wiki/{h.get('id', '')}"}
+        cover, h = hits[0]
+        qid, label, desc = h.get("id", ""), h.get("label", ""), h.get("description", "")
+        kinds = _wikidata_kinds(qid, fetch, labels) if qid else []
+        text = desc or ", ".join(kinds)
+        if text:
+            if kinds and desc:
+                text = f"{desc} ({', '.join(kinds[:3])})"
+            return {"source": "Wikidata", "label": label, "text": text, "cover": cover,
+                    "category": online_category(" ".join([desc] + kinds)),
+                    "url": f"https://www.wikidata.org/wiki/{qid}"}
+    return None
 
-    def similar(label: str) -> bool:
-        a, b = norm(label), norm(q)
-        return bool(a and b) and (a == b or a.startswith(b) or b.startswith(a))
 
-    urls = [("Wikidata", lang, "https://www.wikidata.org/w/api.php?action=wbsearchentities"
-             f"&search={quote(q)}&language={lang}&uselang={lang}&format=json&limit=5")
-            for lang in ("de", "en")]
-    urls += [("Wikipedia", lang, f"https://{lang}.wikipedia.org/w/api.php?action=query"
-              f"&list=search&srsearch={quote(q)}&srlimit=3&format=json&srprop=snippet")
-             for lang in ("de", "en")]
-    answered = False
-    for source, lang, url in urls:
+def _wikidata_kinds(qid: str, fetch, labels: dict) -> list[str]:
+    """Bezeichnungen der „ist ein(e)“-Aussagen (P31), Bezeichnungen zwischengespeichert."""
+    api = "https://www.wikidata.org/w/api.php"
+    data = fetch(f"{api}?action=wbgetclaims&entity={qid}&property=P31&format=json")
+    ids = []
+    for c in (data.get("claims", {}).get("P31", []) if isinstance(data, dict) else []):
         try:
-            data = fetch(url)
-        except HTTPError as e:
-            if e.code == 429:
-                raise OnlineRateLimited() from e
-            answered = True                             # Server erreichbar, nur Fehler
+            ids.append(c["mainsnak"]["datavalue"]["value"]["id"])
+        except (KeyError, TypeError):
             continue
-        except (URLError, OSError, ValueError):
+    missing = [i for i in ids if i not in labels][:20]
+    if missing:
+        d = fetch(f"{api}?action=wbgetentities&ids={'|'.join(missing)}&props=labels"
+                  f"&languages=de|en&format=json")
+        for i, ent in (d.get("entities", {}) if isinstance(d, dict) else {}).items():
+            names = ent.get("labels", {}) if isinstance(ent, dict) else {}
+            labels[i] = (names.get("de") or names.get("en") or {}).get("value", "")
+    return [labels[i] for i in ids if labels.get(i)]
+
+
+def research_wikipedia(q: str, fetch) -> dict | None:
+    import html as _html
+    from urllib.parse import quote
+    for lang in ("de", "en"):
+        data = fetch(f"https://{lang}.wikipedia.org/w/api.php?action=query&list=search"
+                     f"&srsearch={quote(q)}&srlimit=3&format=json&srprop=snippet")
+        raw = (data.get("query", {}).get("search", []) if isinstance(data, dict) else [])
+        for cover, h in _research_best(raw, q, lambda h: (h.get("title", ""),)):
+            title = h.get("title", "")
+            snippet = _html.unescape(re.sub(r"<[^>]+>", "", h.get("snippet", "")))
+            if snippet and not _research_disambiguation(snippet):
+                return {"source": "Wikipedia", "label": title, "text": snippet[:160],
+                        "category": online_category(snippet), "cover": cover,
+                        "url": f"https://{lang}.wikipedia.org/wiki/{quote(title.replace(' ', '_'))}"}
+    return None
+
+
+def research_flathub(q: str, fetch) -> dict | None:
+    data = fetch("https://flathub.org/api/v2/search", data={"query": q})
+    raw = (data.get("hits", []) if isinstance(data, dict) else [])[:10]
+    for cover, h in _research_best(raw, q, lambda h: (h.get("name", ""),))[:1]:
+        name = h.get("name", "")
+        main = h.get("main_categories") or []
+        main = [main] if isinstance(main, str) else list(main)
+        subs = list(h.get("sub_categories") or [])
+        cat = next((FLATHUB_SUB[s] for s in subs if s in FLATHUB_SUB
+                    and not (s == "PackageManager" and "game" not in main)), "")
+        cat = cat or next((FLATHUB_MAIN[m] for m in main if m in FLATHUB_MAIN), "")
+        cat = cat or online_category(h.get("summary", ""))
+        kinds = "/".join(main + subs)
+        return {"source": "Flathub", "label": name, "cover": cover,
+                "text": f"{h.get('summary', '')} ({kinds})" if kinds else h.get("summary", ""),
+                "category": cat, "url": f"https://flathub.org/apps/{h.get('app_id', '')}"}
+    return None
+
+
+def research_chocolatey(q: str, fetch) -> dict | None:
+    import xml.etree.ElementTree as ET
+    from urllib.parse import quote
+    term = quote(q.replace("'", "''"))
+    text = fetch("https://community.chocolatey.org/api/v2/Search()?searchTerm="
+                 f"%27{term}%27&targetFramework=%27%27&includePrerelease=false&$top=8", raw=True)
+    ns = {"a": "http://www.w3.org/2005/Atom",
+          "d": "http://schemas.microsoft.com/ado/2007/08/dataservices",
+          "m": "http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"}
+    seen, pkgs = set(), []
+    for e in ET.fromstring(text).findall("a:entry", ns):
+        pid = (e.findtext("a:title", "", ns) or "").strip()
+        if not pid or pid in seen:
             continue
-        answered = True
-        if source == "Wikidata":
-            hits = [(h.get("label", ""), h.get("description", ""))
-                    for h in data.get("search", [])]
-        else:
-            hits = [(h.get("title", ""), re.sub(r"<[^>]+>", "", h.get("snippet", "")))
-                    for h in data.get("query", {}).get("search", [])]
-        for label, desc in hits:
-            if desc and similar(label):
-                res.update(label=label, description=desc, source=f"{source} ({lang})",
-                           category=online_category(f"{label} {desc}"))
-                if res["category"]:
-                    return res
-        if res["description"]:
-            return res
-        time.sleep(ONLINE_PAUSE)
-    if not answered:
-        raise OnlineUnavailable()
+        seen.add(pid)
+        props = e.find("m:properties", ns)
+        title = (props.findtext("d:Title", "", ns) if props is not None else "") or pid
+        title = re.sub(r"\s*\((install|portable)\)\s*$|^\[deprecated\]\s*", "", title.strip(),
+                       flags=re.I)
+        summary = (e.findtext("a:summary", "", ns) or "").strip()
+        tags = (props.findtext("d:Tags", "", ns) if props is not None else "") or ""
+        # „lghub“ heißt im Text „Logitech G HUB gives you …“ → Textanfang zählt auch
+        lead = summary[:len(q) + 2]
+        pkgs.append({"pid": pid, "title": title, "summary": summary, "tags": tags, "lead": lead})
+    for cover, k in _research_best(pkgs, q, lambda k: (k["title"], k["pid"], k["lead"]))[:1]:
+        return {"source": "Chocolatey", "label": k["title"], "cover": cover,
+                "text": (k["summary"] or k["tags"])[:160],
+                "category": online_category(f"{k['summary']} {k['tags']}"),
+                "url": f"https://community.chocolatey.org/packages/{k['pid']}"}
+    return None
+
+
+def research_targets(items: list[Item]) -> list[Item]:
+    """Was geprüft wird: Verknüpfungen, Programme (.exe/.msi) und Ordner – Unklares zuerst.
+    Dokumente nie (deren Namen sind oft persönlich), eigene Entscheidungen nicht."""
+    out = []
+    for it in items:
+        if it.confidence == "user" or (it.confidence == "keep" and it.role not in RESEARCH_LEAVE):
+            continue
+        if (it.kind in ("lnk", "url", "folder")
+                or (it.kind == "file" and it.path.suffix.lower() in RESEARCH_EXE)) \
+                and online_clean_name(it.label):
+            out.append(it)
+    out.sort(key=lambda i: i.confidence != "low")
+    return out[:RESEARCH_MAX]
+
+
+def research_combine(evidence: list[dict]) -> dict:
+    """Quellen abstimmen lassen. confirmed = Zahl der Quellen, die (bis auf Spiel/Launcher)
+    dasselbe sagen; dissent = Quellen mit anderer Meinung."""
+    votes = [e for e in evidence if e.get("category")]
+    res = {"category": "", "confirmed": 0, "agree": [], "dissent": [], "evidence": evidence}
+    if not votes:
+        return res
+    count: dict[str, int] = {}
+    for e in votes:
+        count[e["category"]] = count.get(e["category"], 0) + 1
+    order = [e["category"] for e in votes]
+    best = max(count, key=lambda c: (count[c], -order.index(c)))
+    fam = research_family(best)
+    res.update(category=best,
+               agree=[e["source"] for e in votes if research_family(e["category"]) == fam],
+               dissent=[f"{e['source']}: {e['category']}" for e in votes
+                        if research_family(e["category"]) != fam])
+    res["confirmed"] = len(res["agree"])
     return res
 
 
-ONLINE_CACHE_DAYS = 90
-ONLINE_LEAVE = ("program", "project")
+def research_lines(res: dict) -> list[str]:
+    out = []
+    for e in res.get("evidence") or []:
+        cat = f" → {e['category']}" if e.get("category") else ""
+        out.append(f"{e['source']}: {e['label']} – {e['text']}{cat}")
+    return out
 
 
-def online_candidates(items: list[Item]) -> list[Item]:
-    """Was nachgeschlagen wird: unklare Ordner und Verknüpfungen zuerst, danach
-    Programmordner (nur zur Info). Dateien nie – deren Namen sind oft persönlich."""
-    unclear = [it for it in items if it.kind in ("folder", "lnk", "url")
-               and it.confidence == "low" and it.role not in ONLINE_LEAVE]
-    progs = [it for it in items if it.kind == "folder" and it.role in ONLINE_LEAVE
-             and "Online:" not in it.reason]
-    return [it for it in unclear + progs if online_clean_name(it.label)][:ONLINE_MAX]
+def research_apply(it: Item, res: dict | None, alias=None) -> str:
+    """Ergebnis gegen die lokale Zuordnung prüfen. Rückgabe: confirmed | corrected |
+    conflict | hint | info | found | none. Eigene Entscheidungen und eigene Regeln gewinnen
+    immer; Programm-/Projektordner bleiben liegen."""
+    if not res or not res.get("evidence"):
+        return "none"
+    first = res["evidence"][0]
+    info = f"{first['source']}: {first['label']} – {first['text']}"
+    cat, n = res.get("category", ""), res.get("confirmed", 0)
+    src = ", ".join(res.get("agree", []))
 
+    def note(text):
+        if "Recherche" not in it.reason and "✓ geprüft" not in it.reason:
+            it.reason = f"{it.reason} · {text}"
 
-def online_resolve(items: list[Item], cache: dict, fetch=None, progress=None,
-                   stop=lambda: False, pause: float = ONLINE_PAUSE) -> tuple[dict, str]:
-    """Namen nachschlagen (Cache zuerst). → ({Pfad: Ergebnis}, Abbruchgrund "" |
-    "limit" | "offline"). Ordner mit Software-Treffer werden auf Programmdateien geprüft."""
-    out, why, asked = {}, "", 0
-    for n, it in enumerate(items, 1):
-        if stop():
-            break
-        q = online_clean_name(it.label).lower()
-        hit = cache.get(q)
-        if hit and time.time() - hit.get("t", 0) < ONLINE_CACHE_DAYS * 86400:
-            res = hit
-        elif why:
-            continue
-        else:
-            if asked:
-                time.sleep(pause)
-            try:
-                res = online_lookup(it.label, fetch)
-            except OnlineRateLimited:
-                why = "limit"
-                continue
-            except OnlineUnavailable:
-                why = "offline"
-                break
-            asked += 1
-            res["t"] = time.time()
-            cache[q] = res
-        if it.kind == "folder" and res.get("category"):
-            res = dict(res, binaries=folder_has_binaries(it.path))
-        out[str(it.path)] = res
-        if progress:
-            progress(n, len(items), it.label)
-    return out, why
-
-
-def apply_online(it: Item, res: dict, alias=None) -> bool:
-    """Ergebnis übernehmen. True = Zuordnung geändert. Programm-/Projektordner und
-    eigene Entscheidungen bekommen nur die Info dazu."""
-    if not res or not res.get("description"):
-        return False
-    info = f"Online: {res['label']} – {res['description']}"
-    if it.role in ONLINE_LEAVE or it.confidence in ("user", "keep"):
-        if "Online:" not in it.reason:
-            it.reason = f"{it.reason} · {info}"
-        return False
-    if it.kind == "folder" and res.get("category") and res.get("binaries"):
+    if it.kind == "folder" and cat and res.get("binaries") and it.role not in RESEARCH_LEAVE \
+            and it.confidence not in ("user", "keep"):
         it.role, it.category, it.confidence = "program", "Sonstiges", "keep"
-        it.reason = f"Programmordner (enthält {res['binaries']}) – bleibt liegen · {info}"
-        return True
-    if res.get("category"):
-        it.category = alias(res["category"]) if alias else res["category"]
-        it.confidence = "medium"
-        it.reason = f"{info} ({res['source']})"
-        return True
-    it.reason = info
-    return False
+        it.reason = f"Programmordner (enthält {res['binaries']}) – bleibt liegen · Recherche: {info}"
+        return "corrected"
+    if it.role in RESEARCH_LEAVE or it.confidence in ("user", "keep"):
+        note(f"Recherche: {info}")
+        return "info"
+    if not cat:
+        if it.confidence == "low":
+            it.reason = f"Recherche: {info} (keine passende Gruppe)"
+        else:
+            note(f"Recherche: {info}")
+        return "found"
+    target = alias(cat) if alias else cat
+    local = it.category if it.confidence in ("high", "medium") else ""
+    if local and (research_family(local) == research_family(cat) or local == target):
+        note(f"✓ geprüft ({src})")
+        if n >= 2 and it.confidence == "medium":
+            it.confidence = "high"
+        return "confirmed"
+    if local:
+        authoritative = it.reason.startswith("eigene Regel") or it.reason.startswith("Inhalt:")
+        if n >= 2 and not authoritative:
+            it.reason = (f"⚠ Bitte prüfen: hier „{local}“ ({it.reason}), "
+                         f"Recherche sagt „{cat}“ ({src})")
+            it.category, it.confidence = target, "low"
+            return "conflict"
+        note(f"Recherche-Hinweis: {src} meint „{cat}“")
+        return "hint"
+    it.category = target
+    it.confidence = "high" if n >= 2 else "medium"
+    it.reason = f"Recherche: {info} ({src})"
+    return "corrected"
 
 
-def online_cache_load() -> dict:
+RESEARCH_FUNCS = {"wikidata": research_wikidata, "wikipedia": research_wikipedia,
+                  "flathub": research_flathub, "chocolatey": research_chocolatey}
+
+
+def research_run(items: list[Item], cache: dict, fetch=None, sources=None, progress=None,
+                 stop=lambda: False, force: bool = False, pauses: dict | None = None):
+    """Alle Namen in allen Quellen nachschlagen – je Server ein eigener Strang mit
+    Pause zwischen den Anfragen, Wikipedia nur, wenn Wikidata nichts findet.
+    → ({Pfad: Ergebnis}, {Quelle: "ok" | "limit" | "offline"})."""
+    from urllib.error import HTTPError
+    fetch = fetch or _online_fetch
+    sources = [s for s in (sources or list(RESEARCH_SOURCES)) if s in RESEARCH_FUNCS]
+    queries: dict[str, str] = {}
+    for it in items:
+        q = online_clean_name(it.label)
+        if q:
+            queries.setdefault(q.casefold(), q)
+    lanes = [[s for s in ("wikidata", "wikipedia") if s in sources]]
+    lanes += [[s] for s in ("flathub", "chocolatey") if s in sources]
+    lanes = [lane for lane in lanes if lane]
+    evidence: dict[str, dict] = {k: {} for k in queries}
+    status = {s: "ok" for s in sources}
+    labels = cache.setdefault("_labels", {})
+    total, done = max(1, len(queries) * len(lanes)), [0]
+    lock = threading.Lock()
+    now = time.time()
+
+    def fresh(entry) -> bool:
+        days = RESEARCH_CACHE_DAYS if entry.get("ev") else RESEARCH_MISS_DAYS
+        return not force and now - entry.get("t", 0) < days * 86400
+
+    def lane_worker(lane):
+        pause = min((pauses or {}).get(s, RESEARCH_SOURCES[s][2]) for s in lane)
+        last = [0.0]
+
+        def throttled(url, data=None, raw=False):
+            wait = last[0] + pause - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                return fetch(url, data=data, raw=raw)
+            finally:
+                last[0] = time.time()
+
+        fails = 0
+        for key, q in queries.items():
+            if stop():
+                return
+            for src in lane:
+                if status[src] != "ok":
+                    continue
+                if src == "wikipedia" and evidence[key].get("wikidata"):
+                    continue
+                entry = cache.setdefault(src, {}).get(key)
+                if entry and fresh(entry):
+                    evidence[key][src] = entry.get("ev")
+                    continue
+                try:
+                    if src == "wikidata":
+                        ev = research_wikidata(q, throttled, labels)
+                    else:
+                        ev = RESEARCH_FUNCS[src](q, throttled)
+                    fails = 0
+                except HTTPError as e:
+                    if e.code == 429:
+                        status[src] = "limit"
+                        continue
+                    if e.code != 404:                   # 404 = einfach nichts gefunden
+                        fails += 1
+                        if fails >= 2:
+                            status[src] = "offline"
+                        continue
+                    ev = None
+                except Exception:                       # noqa: BLE001 — Netz, Format, XML
+                    fails += 1
+                    if fails >= 2:
+                        status[src] = "offline"
+                    continue
+                cache[src][key] = {"t": time.time(), "ev": ev}
+                evidence[key][src] = ev
+            with lock:
+                done[0] += 1
+                if progress:
+                    progress(done[0], total, q)
+
+    threads = [threading.Thread(target=lane_worker, args=(lane,), daemon=True) for lane in lanes]
+    for t in threads:
+        t.start()
+    for t in threads:
+        while t.is_alive():
+            t.join(0.2)
+            if stop():
+                break
+    results = {}
+    for it in items:
+        q = online_clean_name(it.label)
+        if not q:
+            continue
+        need = RESEARCH_MIN_COVER_FOLDER if it.kind == "folder" else RESEARCH_MIN_COVER
+        ev = [e for s in sources if (e := evidence.get(q.casefold(), {}).get(s))
+              and e.get("cover", 1.0) >= need]
+        res = research_combine(ev)
+        if it.kind == "folder" and res["category"]:
+            res["binaries"] = folder_has_binaries(it.path)
+        results[str(it.path)] = res
+    return results, status
+
+
+def research_status_text(status: dict) -> str:
+    bad = {"limit": "bremst gerade", "offline": "nicht erreichbar"}
+    return " · ".join(f"{RESEARCH_SOURCES[s][0]} {bad[v]}" for s, v in status.items() if v in bad)
+
+
+def research_cache_load() -> dict:
     try:
-        data = json.loads(ONLINE_CACHE.read_text(encoding="utf-8"))
+        data = json.loads(RESEARCH_CACHE.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
-def online_cache_save(cache: dict) -> None:
-    try:
-        ONLINE_CACHE.parent.mkdir(exist_ok=True)
-        ONLINE_CACHE.write_text(json.dumps(cache, indent=1, ensure_ascii=False), encoding="utf-8")
-    except OSError:
-        pass
+def research_cache_save(cache: dict) -> None:
+    """Mit dem Stand auf der Platte zusammenführen (Hauptfenster und Boxen schreiben beide)."""
+    with _RESEARCH_LOCK:
+        disk = research_cache_load()
+        for k, v in cache.items():
+            if isinstance(v, dict):
+                disk.setdefault(k, {}).update(v)
+        limit = time.time() - RESEARCH_CACHE_DAYS * 86400
+        for k, v in disk.items():
+            if k != "_labels" and isinstance(v, dict):
+                disk[k] = {q: e for q, e in v.items()
+                           if isinstance(e, dict) and e.get("t", 0) > limit}
+        try:
+            RESEARCH_CACHE.parent.mkdir(exist_ok=True)
+            RESEARCH_CACHE.write_text(json.dumps(disk, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
 
 
-def _anon(s: str) -> str:
-    """Benutzerpfad vor dem API-Versand maskieren."""
-    home = str(Path.home())
-    return re.sub(re.escape(home), "%USERPROFILE%", s, flags=re.I) if s else s
-
-
-def classify_with_claude(items: list[Item], all_items: list[Item], model: str,
-                         extra_groups: list[str] | None = None) -> None:
-    """Semantische Gruppierung. Gesendet werden nur Anzeigename, Typ und Ziel
-    (Benutzerpfad maskiert) — keine Dateiinhalte."""
-    try:
-        import anthropic
-    except ModuleNotFoundError:
-        sys.exit("--ai benötigt:  pip install anthropic")
-    if not items:
-        return
-    payload = [{"id": i, "name": it.label, "typ": it.kind, "ziel": _anon(it.target),
-                "vorschlag": it.category} for i, it in enumerate(items)]
-    context = sorted({f"{it.label} → {it.category}" for it in all_items
-                      if it not in items and it.kind != "folder"})
-    schema = {
-        "type": "object",
-        "properties": {"zuordnungen": {"type": "array", "items": {
-            "type": "object",
-            "properties": {"id": {"type": "integer"},
-                           "kategorie": {"type": "string"},
-                           "begruendung": {"type": "string"}},
-            "required": ["id", "kategorie", "begruendung"],
-            "additionalProperties": False}}},
-        "required": ["zuordnungen"], "additionalProperties": False,
-    }
-    prompt = f"""Gruppiere Windows-Desktop-Objekte thematisch, wie die iOS-App-Mediathek.
-
-Standardkategorien (bevorzugt verwenden, exakt so schreiben; die ersten sind die schon
-vorhandenen Boxen des Nutzers und haben Vorrang):
-{json.dumps(list(dict.fromkeys(list(extra_groups or []) + CATEGORIES)), ensure_ascii=False)}
-
-Ordner (typ "folder") nur einordnen, wenn sie Inhalte enthalten (Fotos, Dokumente …);
-Programm- oder Spielordner gehören nicht dazu.
-
-Regeln:
-- Thema schlägt Dateityp: eine PDF-Rechnung gehört zu "Finanzen", nicht "Büro & Dokumente".
-- Spiele (auch unbekannte Indie-Titel) → "Spiele"; Launcher, Mods, Overlays, Build-Planer
-  → "Spiele-Launcher & Tools".
-- Du darfst höchstens 3 NEUE Themen anlegen, aber nur wenn ≥3 Objekte klar zu einem
-  Projekt/Thema gehören (z. B. Grundrisse + CAD-Dateien + Planungs-Apps → "Hausplanung").
-  Neue Themen: kurz, deutsch, ohne Sonderzeichen <>:"/\\|?*.
-- "vorschlag" stammt aus einer Heuristik — übernehmen oder verwerfen.
-- Unbekanntes ehrlich → "Sonstiges". Begründung: max. 8 Wörter.
-
-Bereits sicher zugeordnet (nur Kontext):
-{chr(10).join(context) or "—"}
-
-Zu klassifizieren:
-{json.dumps(payload, ensure_ascii=False, indent=1)}"""
-
-    client = anthropic.Anthropic()
-    try:
-        resp = client.beta.messages.create(
-            model=model,
-            max_tokens=16000,
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-            output_config={"effort": "low",
-                           "format": {"type": "json_schema", "schema": schema}},
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except anthropic.AuthenticationError:
-        sys.exit("Kein gültiger API-Schlüssel (ANTHROPIC_API_KEY).")
-    except anthropic.APIStatusError as e:
-        print(f"Claude übersprungen (HTTP {e.status_code}): {e.message}", file=sys.stderr)
-        return
-    except anthropic.APIConnectionError:
-        print("Claude übersprungen: keine Verbindung.", file=sys.stderr)
-        return
-    if resp.stop_reason != "end_turn":
-        print(f"Claude übersprungen (stop_reason={resp.stop_reason}).", file=sys.stderr)
-        return
-    text = next(b.text for b in resp.content if b.type == "text")
-    for z in json.loads(text)["zuordnungen"]:
-        if 0 <= z["id"] < len(items):
-            cat = re.sub(r'[<>:"/\\|?*]', "", z["kategorie"]).strip() or "Sonstiges"
-            it = items[z["id"]]
-            it.category, it.reason, it.confidence = cat, f"Claude: {z['begruendung']}", "medium"
+def research_settings(cfg: dict | None) -> tuple[bool, list[str]]:
+    r = (cfg or {}).get("research") or {}
+    srcs = [s for s in r.get("sources", list(RESEARCH_SOURCES)) if s in RESEARCH_SOURCES]
+    return bool(r.get("on", True)), srcs
 
 
 # --------------------------------------------------------------------------- #
@@ -8958,7 +9168,7 @@ try:
     import PySide6  # noqa: F401
 except ImportError:
     _fatal("PySide6 fehlt. Einmalig in PowerShell ausführen:\n\n"
-           "py -m pip install PySide6 PySideSix-Frameless-Window anthropic")
+           "py -m pip install PySide6 PySideSix-Frameless-Window")
 
 
 def _isolate_qt() -> None:
@@ -9175,6 +9385,22 @@ def shadow(widget: QWidget, blur=32, dy=10, alpha=90) -> None:
 # --------------------------------------------------------------------------- #
 # Glas-Widgets
 # --------------------------------------------------------------------------- #
+class ElideLabel(QLabel):
+    """Einzeilig, kürzt bei Platzmangel mit „…“ statt das Fenster zu verbreitern."""
+    def setText(self, text: str):
+        super().setText(text)
+        self.setToolTip(text)
+
+    def minimumSizeHint(self):
+        return QSize(0, super().minimumSizeHint().height())
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        text = self.fontMetrics().elidedText(self.text(), Qt.ElideRight, self.width())
+        self.style().drawItemText(p, self.rect(), Qt.AlignLeft | Qt.AlignVCenter, self.palette(),
+                                  self.isEnabled(), text, self.foregroundRole())
+
+
 class GlassPanel(QWidget):
     def __init__(self, radius=22, parent=None):
         super().__init__(parent)
@@ -9542,20 +9768,19 @@ class Worker(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
-class OnlineJob(QObject):
-    """Nachschlagen im Hintergrund, ohne die Oberfläche zu sperren. Daemon-Thread:
+class ResearchJob(QObject):
+    """Recherche im Hintergrund, ohne die Oberfläche zu sperren. Daemon-Thread:
     eine hängende Anfrage hält das Beenden des Programms nicht auf."""
     progress = Signal(int, int, str)
-    finished = Signal(dict, str)
+    finished = Signal(dict, dict)
 
-    def __init__(self, items: list[Item], parent=None, fetch=None):
+    def __init__(self, items: list[Item], sources: list[str], parent=None, force=False):
         super().__init__(parent)
-        self.items, self.fetch = items, fetch
+        self.items, self.sources, self.force = items, sources, force
         self.cancel = False
         self._thread = None
 
     def start(self):
-        import threading
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -9563,14 +9788,15 @@ class OnlineJob(QObject):
         return bool(self._thread and self._thread.is_alive())
 
     def _run(self):
-        cache = online_cache_load()
+        cache = research_cache_load()
         try:
-            res, why = online_resolve(self.items, cache, self.fetch, self.progress.emit,
-                                      stop=lambda: self.cancel)
+            res, status = research_run(self.items, cache, sources=self.sources,
+                                       progress=self.progress.emit, stop=lambda: self.cancel,
+                                       force=self.force)
         except Exception as e:               # noqa: BLE001 — in der GUI anzeigen
-            res, why = {}, f"Fehler: {type(e).__name__}: {e}"
-        online_cache_save(cache)
-        self.finished.emit(res, why)
+            res, status = {}, {"_error": f"{type(e).__name__}: {e}"}
+        research_cache_save(cache)
+        self.finished.emit(res, status)
 
 
 # --------------------------------------------------------------------------- #
@@ -9592,9 +9818,11 @@ class MainWindow(_Base):
         self.selected: str | None = None
         self.user_dir: Path | None = None
         self._worker: Worker | None = None
-        self._online: OnlineJob | None = None
-        self._online_mode = ""          # ohne Boxen-Verwaltung: Zustimmung nur für die Sitzung
-        self.online_results: dict[str, dict] = {}    # Pfad → Ergebnis, übersteht Neu-Scans
+        self._research: ResearchJob | None = None
+        self._research_cfg: dict = {}   # ohne Boxen-Verwaltung: Einstellungen nur für die Sitzung
+        self.research_results: dict[str, dict] = {}  # Pfad → Ergebnis, übersteht Neu-Scans
+        self._apply_pending = False     # „In Boxen sortieren“ wartet auf die Recherche
+        self._research_next = None      # nach Abbruch als Nächstes starten
 
         self.setWindowTitle("Desktop Sorter")
         self.setWindowIcon(app_icon())
@@ -9626,8 +9854,11 @@ class MainWindow(_Base):
         title.setObjectName("h1")
         self.subtitle = QLabel("…")
         self.subtitle.setObjectName("sub")
+        self.research_label = ElideLabel("")
+        self.research_label.setObjectName("sub")
         titles.addWidget(title)
         titles.addWidget(self.subtitle)
+        titles.addWidget(self.research_label)
         head.addLayout(titles)
         head.addStretch(1)
 
@@ -9671,12 +9902,11 @@ class MainWindow(_Base):
             tools.addWidget(line)
             tools.addSpacing(6)
 
-        self.b_ai = tool("✦  Mit Claude", self.run_ai,
-                         "Unklare Objekte per KI zuordnen (API-Schlüssel nötig)")
-        self.b_online = tool("🌐  Online nachschlagen", lambda: self.online_lookup(),
-                             "Unklare Ordner und Verknüpfungen bei Wikidata/Wikipedia "
-                             "nachschlagen – z. B. ob „Diablo III“ ein Spiel ist.\n"
-                             "Gesendet wird nur der bereinigte Name.")
+        self.b_research = tool("🔎  Recherche ▾", self.show_research_menu,
+                               "Jede Zuordnung wird in offenen Quellen gegengeprüft "
+                               "(Wikidata, Wikipedia, Flathub, Chocolatey) – bei jedem Scan "
+                               "und vor dem Sortieren.\nGesendet werden nur Namen von "
+                               "Verknüpfungen, Programmen und Ordnern.")
         self.b_undo = tool("↶  Rückgängig", self.undo, "Letzte Sortierung vollständig umkehren")
         divider()
         self.b_org = tool("📁  Ordner-Assistent ▾", self.show_organizer_menu,
@@ -9764,7 +9994,7 @@ class MainWindow(_Base):
         body.addWidget(self.desk)
         root.addLayout(body, 1)
 
-        self.busy_widgets = [self.b_scan, self.b_ai, self.b_online, self.b_undo, self.b_apply,
+        self.busy_widgets = [self.b_scan, self.b_research, self.b_undo, self.b_apply,
                              self.b_trash, self.b_accept, self.t_public, self.t_folders,
                              self.grid, self.detail, self.desk] + self._fence_only
         self.set_busy(None)
@@ -9824,8 +10054,6 @@ class MainWindow(_Base):
     def set_busy(self, text: str | None):
         for w in self.busy_widgets:
             w.setEnabled(text is None and (self.fences is not None or w not in self._fence_only))
-        if self._online and self._online.is_running():
-            self.b_online.setEnabled(False)
         if text:
             self.subtitle.setText(text)
         if bool(text) != getattr(self, "_busy", False):
@@ -9870,14 +10098,18 @@ class MainWindow(_Base):
 
         def done(res):
             self.user_dir, self.items = res
-            for it in self.items:
-                if str(it.path) in self.online_results:
-                    apply_online(it, self.online_results[str(it.path)], self.memory.alias)
+            self.apply_research()                    # bekannte Ergebnisse sofort
             self.refresh()
-            pending = [it for it in online_candidates(self.items)
-                       if str(it.path) not in self.online_results]
-            if self.online_mode() == "auto" and pending:
-                QTimer.singleShot(300, lambda: self.online_lookup(auto=True, items=pending))
+            on, srcs = self.research_settings()
+            pending = [it for it in research_targets(self.items)
+                       if str(it.path) not in self.research_results]
+            if on and srcs and pending:
+                self.start_research(pending)
+            else:
+                self.update_research_label()
+                if self._apply_pending:
+                    self._apply_pending = False
+                    QTimer.singleShot(0, self.apply)
 
         self.run_bg("Scanne Desktop …", job, done)
 
@@ -9912,7 +10144,7 @@ class MainWindow(_Base):
         unclear = progs = 0
         for it in left:
             low = it.confidence == "low"
-            prog = it.role in ONLINE_LEAVE and not low
+            prog = it.role in RESEARCH_LEAVE and not low
             unclear += low
             progs += prog
             icon = self.icon_for(it)
@@ -9926,13 +10158,14 @@ class MainWindow(_Base):
             if low:
                 tip = (f"Unklar — Vorschlag: {it.category} ({it.reason})\nDoppelklick = übernehmen"
                        if it.category != "Sonstiges" else
-                       "Unklar — keine Zuordnung gefunden" + (f"\n{it.reason}" if "Online:" in it.reason else ""))
+                       "Unklar — keine Zuordnung gefunden" +
+                       (f"\n{it.reason}" if "Recherche" in it.reason else ""))
             elif prog:
                 tip = (f"Bleibt liegen, damit es weiter funktioniert:\n{it.reason}\n"
                        f"Auf eine Gruppe ziehen verschiebt trotzdem (mit Rückfrage).")
             else:
                 tip = f"Bleibt auf dem Desktop ({it.reason})"
-            li.setToolTip(tip)
+            li.setToolTip(tip + self.research_tip(it))
             self.desk_list.addItem(li)
         parts = [f"{unclear} unklar"] if unclear else []
         parts += [f"{progs} Programmordner"] if progs else []
@@ -9957,7 +10190,7 @@ class MainWindow(_Base):
             for it in its:
                 li = QListWidgetItem(self.icon_for(it), it.label)
                 li.setData(Qt.UserRole, index[id(it)])
-                li.setToolTip(it.reason)
+                li.setToolTip(it.reason + self.research_tip(it))
                 self.detail_list.addItem(li)
             for p in box or []:                     # schon in der Box: nur ansehen/öffnen
                 li = QListWidgetItem(faded_icon(self.icons.get(p)), display_name(p))
@@ -9981,7 +10214,7 @@ class MainWindow(_Base):
     def assign(self, ids, group: str):
         ids = [i for i in ids if 0 <= i < len(self.items)]
         progs = [self.items[i] for i in ids
-                 if self.items[i].role in ONLINE_LEAVE and self.items[i].confidence != "user"]
+                 if self.items[i].role in RESEARCH_LEAVE and self.items[i].confidence != "user"]
         if progs and not self.confirm(
                 "Programmordner verschieben?",
                 "Diese Ordner sehen nach installierten Programmen, Spielen oder Projekten aus:\n\n"
@@ -10085,10 +10318,10 @@ class MainWindow(_Base):
             if one.category != "Sonstiges":
                 m.addAction(f"★  Als Regel für „{one.category}“ merken …",
                             lambda: self.remember_rule(one))
-        web = [i for i in its if i.kind in ("folder", "lnk", "url") and online_clean_name(i.label)]
+        web = [i for i in its if i in research_targets(its)]
         if web:
-            act = m.addAction("🌐  Online nachschlagen", lambda: self.online_lookup(items=web))
-            act.setEnabled(not (self._online and self._online.is_running()))
+            act = m.addAction("🔎  Erneut recherchieren", lambda: self.start_research(web, force=True))
+            act.setEnabled(not self.research_running())
         m.addSeparator()
         m.addAction("🗑  In den Papierkorb …", lambda: self.trash_items(ids))
         m.exec(pos)
@@ -10135,7 +10368,7 @@ class MainWindow(_Base):
         for p in paths:
             it = by_path.get(str(p))
             role = it.role if it else (folder_role(p)[0] if p.is_dir() else "")
-            if role in ONLINE_LEAVE:
+            if role in RESEARCH_LEAVE:
                 warn_prog.append(p.name)
             if str(p) in protected:
                 warn_important.append(f"{display_name(p)} (von dir als wichtig geschützt)")
@@ -10190,10 +10423,6 @@ class MainWindow(_Base):
         m.addAction("+  Neue Ordner-Box …", lambda: (f.new_portal(), self.refresh()))
         m.addMenu(f.layouts_menu(m))
         m.addMenu(f.settings_menu(m))
-        auto = m.addAction("🌐  Unklares nach jedem Scan online nachschlagen")
-        auto.setCheckable(True)
-        auto.setChecked(self.online_mode() == "auto")
-        auto.toggled.connect(self.set_online_auto)
         if self.args.rules:
             m.addAction("✎  Eigene Regeln bearbeiten (regeln.toml)",
                         lambda: self.open_item(self.args.rules))
@@ -10201,86 +10430,156 @@ class MainWindow(_Base):
         m.addAction("⏻  Desktop Sorter beenden", QApplication.quit)
         self._menu_below(m, self.b_more)
 
-    # ---------- Online nachschlagen (Wikidata / Wikipedia) ----------
-    def online_mode(self) -> str:
-        """"" = noch nicht erlaubt, "manual" = auf Knopfdruck, "auto" = nach jedem Scan."""
-        return (self.fences.cfg.get("online_lookup", "") if self.fences else self._online_mode)
+    # ---------- Recherche in offenen Quellen ----------
+    def research_settings(self) -> tuple[bool, list[str]]:
+        return research_settings(self.fences.cfg if self.fences else {"research": self._research_cfg})
 
-    def _set_online_mode(self, mode: str):
+    def _set_research(self, on: bool, sources: list[str]):
+        cfg = {"on": on, "sources": [s for s in RESEARCH_SOURCES if s in sources]}
         if self.fences:
-            self.fences.cfg["online_lookup"] = mode
+            self.fences.cfg["research"] = cfg
             self.fences.write_cfg()
         else:
-            self._online_mode = mode
+            self._research_cfg = cfg
 
-    def online_consent(self) -> bool:
-        if self.online_mode():
-            return True
-        box = QMessageBox(QMessageBox.Question, "Online nachschlagen",
-                          "Für unklare Ordner und Verknüpfungen fragt Desktop Sorter bei "
-                          "Wikidata und Wikipedia nach, was sich hinter dem Namen verbirgt – "
-                          "z. B. „Diablo III → Computerspiel“ oder „Arduino → Mikrocontroller-"
-                          "Plattform“.\n\nGesendet wird nur der bereinigte Name (ohne Pfade, "
-                          "ohne Inhalte, nie Dateinamen von Dokumenten). Ergebnisse werden "
-                          "90 Tage lokal zwischengespeichert.\n\n(Google bietet dafür keine "
-                          "freie Schnittstelle; Wikidata ist die offene Wissensdatenbank "
-                          "hinter vielen Suchmaschinen-Infoboxen.)", parent=self)
-        b_auto = box.addButton("Immer automatisch", QMessageBox.AcceptRole)
-        b_once = box.addButton("Nur auf Knopfdruck", QMessageBox.AcceptRole)
-        box.addButton("Abbrechen", QMessageBox.RejectRole)
-        box.setDefaultButton(b_once)
-        box.exec()
-        mode = {b_auto: "auto", b_once: "manual"}.get(box.clickedButton(), "")
-        if mode:
-            self._set_online_mode(mode)
-        return bool(mode)
+    def research_running(self) -> bool:
+        """Läuft – oder das Ergebnis ist noch nicht zugestellt."""
+        return self._research is not None
 
-    def set_online_auto(self, on: bool):
-        if on and not self.online_mode() and not self.online_consent():
+    def show_research_menu(self):
+        on, srcs = self.research_settings()
+        m = glass_menu(self)
+        m.setToolTipsVisible(True)
+        auto = m.addAction("✓  Immer prüfen – bei jedem Scan und vor dem Sortieren")
+        auto.setCheckable(True)
+        auto.setChecked(on)
+        auto.toggled.connect(lambda v: self.reset_research(v, srcs))
+        again = m.addAction("↻  Alles jetzt neu prüfen (ohne Zwischenspeicher)",
+                            lambda: self.start_research(force=True))
+        again.setEnabled(on and bool(srcs) and not self.research_running())
+        m.addSeparator()
+        head = m.addAction("Quellen")
+        head.setEnabled(False)
+        for key, (name, host, _pause, what) in RESEARCH_SOURCES.items():
+            act = m.addAction(f"{name}  ·  {host}")
+            act.setCheckable(True)
+            act.setChecked(key in srcs)
+            act.setToolTip(what)
+            act.toggled.connect(lambda v, k=key: self.reset_research(
+                on, [s for s in RESEARCH_SOURCES if (s in srcs and s != k) or (s == k and v)]))
+        m.addSeparator()
+        m.addAction("🗑  Zwischenspeicher leeren", self.clear_research_cache)
+        note = m.addAction("Gesendet werden nur Namen von Verknüpfungen, Programmen und "
+                           "Ordnern – nie Dokumente, Pfade oder Inhalte.")
+        note.setEnabled(False)
+        self._menu_below(m, self.b_research)
+
+    def reset_research(self, on: bool, sources: list[str]):
+        """Einstellung geändert: frisch scannen, dann mit den neuen Quellen prüfen."""
+        self._set_research(on, sources)
+        if self._research:
+            self._research.cancel = True
+        self.research_results.clear()
+        self.rescan()
+
+    def clear_research_cache(self):
+        with _RESEARCH_LOCK:
+            try:
+                RESEARCH_CACHE.unlink()
+            except OSError:
+                pass
+        on, srcs = self.research_settings()
+        self.reset_research(on, srcs)
+
+    def start_research(self, items=None, force=False):
+        if self.research_running():
+            if self._research.cancel:           # abgebrochener Lauf endet gleich
+                self._research_next = (items, force)
             return
-        self._set_online_mode("auto" if on else ("manual" if self.online_mode() else ""))
-        if on:
-            self.online_lookup(auto=True)
+        on, srcs = self.research_settings()
+        todo = list(items) if items is not None else research_targets(self.items)
+        if not (on and srcs and todo):
+            return self.update_research_label()
+        self._research = ResearchJob(todo, srcs, self, force)
+        self._research.progress.connect(self._research_progress)
+        self._research.finished.connect(self._research_done)
+        names = ", ".join(RESEARCH_SOURCES[s][0] for s in srcs)
+        self.research_label.setText(f"🔎  Recherche läuft: {len(todo)} Namen in {names} …")
+        self._research.start()
 
-    def online_lookup(self, auto=False, items=None):
-        if self._online and self._online.is_running():
-            return
-        todo = list(items) if items else online_candidates(self.items)
-        if not todo:
-            if not auto:
-                self.message("Online nachschlagen", "Nichts nachzuschlagen: keine unklaren "
-                             "Ordner oder Verknüpfungen mit einem verwertbaren Namen.")
-            return
-        if not self.online_consent():
-            return
-        self._online = OnlineJob(todo[:ONLINE_MAX], self)
-        self._online.progress.connect(self._online_progress)
-        self._online.finished.connect(self._online_done)
-        self.b_online.setEnabled(False)
-        self.b_online.setText(f"🌐  0/{len(self._online.items)} …")
-        self._online.start()
+    def _research_progress(self, n: int, total: int, name: str):
+        if self.research_running():
+            self.research_label.setText(f"🔎  Recherche läuft: {n}/{total} Abfragen – „{name}“"
+                                        + (" · sortiert wird danach" if self._apply_pending else ""))
 
-    def _online_progress(self, n: int, total: int, name: str):
-        self.b_online.setText(f"🌐  {n}/{total} …")
-
-    def _online_done(self, results: dict, why: str):
-        self.b_online.setText("🌐  Online nachschlagen")
-        self.b_online.setEnabled(not getattr(self, "_busy", False))
-        self.online_results.update(results)
-        by_path = {str(it.path): it for it in self.items}
-        changed = sum(apply_online(by_path[p], r, self.memory.alias) for p, r in results.items() if p in by_path)
-        found = sum(bool(r.get("description")) for r in results.values())
+    def _research_done(self, results: dict, status: dict):
+        job, self._research = self._research, None
+        if job and job.cancel:
+            nxt, self._research_next = self._research_next, None
+            if nxt:
+                self.start_research(*nxt)
+            return
+        self.research_status = status
+        self.research_results.update(results)
+        if job and job.force:                   # frisch klassifizieren, dann neu anwenden
+            return self.rescan()
+        self.apply_research()
         if not (self._worker and self._worker.isRunning()):
             self.refresh()
-        note = (f"Online nachgeschlagen: {found} von {len(results)} erkannt, "
-                f"{changed} neu zugeordnet")
-        if why == "limit":
-            note += " · Wikimedia bremst gerade, später erneut versuchen"
-        elif why == "offline":
-            note += " · keine Verbindung zu Wikidata/Wikipedia"
-        elif why:
-            note += f" · {why}"
-        self.subtitle.setText(note)
+        self.update_research_label()
+        if self._apply_pending:
+            self._apply_pending = False
+            QTimer.singleShot(0, self.apply)
+
+    def apply_research(self):
+        """Ergebnisse auf frisch eingeordnete Objekte anwenden (jedes nur einmal)."""
+        for it in self.items:
+            res = self.research_results.get(str(it.path))
+            if res is not None and not it.check:
+                it.check = research_apply(it, res, self.memory.alias)
+
+    def research_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for it in self.items:
+            if it.check:
+                counts[it.check] = counts.get(it.check, 0) + 1
+        return counts
+
+    def update_research_label(self):
+        on, srcs = self.research_settings()
+        if not (on and srcs):
+            self.research_label.setText("🔎  Recherche aus – Zuordnung nur lokal "
+                                        "(einschalten über „Recherche ▾“)")
+            return
+        if self.research_running():
+            return
+        c = self.research_counts()
+        parts = [f"{c.get('confirmed', 0)} bestätigt", f"{c.get('corrected', 0)} ergänzt"]
+        if c.get("conflict"):
+            n = c["conflict"]
+            parts.append(f"{n} {'Widerspruch' if n == 1 else 'Widersprüche'} (orange ?)")
+        if c.get("hint"):
+            parts.append(f"{c['hint']} {'Hinweis' if c['hint'] == 1 else 'Hinweise'}")
+        none = c.get("none", 0) + c.get("found", 0)
+        if none:
+            parts.append(f"{none} ohne Zuordnung")
+        text = f"🔎  Recherche ({len(srcs)} Quellen): " + " · ".join(parts)
+        problems = research_status_text(getattr(self, "research_status", {}))
+        if problems:
+            text += f"  ·  ⚠ {problems}"
+        self.research_label.setText(text)
+        self.research_label.setToolTip(
+            text + "\n\nGeprüft mit: " + ", ".join(RESEARCH_SOURCES[s][0] for s in srcs) +
+            "\nDetails je Objekt im Tooltip; Einstellungen unter „Recherche ▾“.")
+
+    def research_tip(self, it: Item) -> str:
+        res = self.research_results.get(str(it.path))
+        if res is None:
+            return ""
+        lines = research_lines(res)
+        if not lines:
+            return "\n\nRecherche: in keiner Quelle gefunden"
+        return "\n\nRecherche:\n" + "\n".join(f"• {line}" for line in lines[:4])
 
     def remember_rule(self, it: Item):
         stem = it.label.split("_")[0].split(" ")[0]
@@ -10342,43 +10641,32 @@ class MainWindow(_Base):
         if old in self.memory.keywords:
             self.memory.keywords.setdefault(new, []).extend(self.memory.keywords.pop(old))
 
-    # ---------- Claude / Ausführen / Undo ----------
-    def run_ai(self):
-        todo = [it for it in self.items if it.confidence == "low"
-                and (it.kind != "folder" or self.t_folders.isChecked())]
-        if not todo:
-            return self.message("Nichts zu tun", "Es gibt keine unklaren Objekte.")
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            dlg = QInputDialog(self)
-            dlg.setWindowTitle("Claude API-Schlüssel")
-            dlg.setLabelText("ANTHROPIC_API_KEY (gilt nur für diese Sitzung):")
-            dlg.setTextEchoMode(QLineEdit.Password)
-            if not dlg.exec() or not dlg.textValue().strip():
-                return
-            os.environ["ANTHROPIC_API_KEY"] = dlg.textValue().strip()
-
-        def job():
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                classify_with_claude(todo, self.items, self.args.model,
-                                     extra_groups=list(self.box_dirs()))
-            return err.getvalue().strip()
-
-        def done(msg):
-            self.refresh()
-            if msg:
-                self.message("Claude", msg, warn=True)
-
-        self.run_bg(f"Claude ordnet {len(todo)} Objekt(e) zu …", job, done)
-
+    # ---------- Ausführen / Undo ----------
     def apply(self):
+        if self.research_running():             # erst alles prüfen, dann sortieren
+            self._apply_pending = True
+            self.research_label.setText("🔎  Recherche läuft noch – sortiert wird, sobald "
+                                        "alles geprüft ist …")
+            return
         groups, _ = self.plan()
         n = sum(len(g) for g in groups.values())
         if not n:
             return self.message("Nichts zu tun", "Keine Objekte zum Einsortieren.")
+        on, srcs = self.research_settings()
+        c = self.research_counts()
+        if on and srcs:
+            check = (f"Geprüft mit {', '.join(RESEARCH_SOURCES[s][0] for s in srcs)}: "
+                     f"{c.get('confirmed', 0)} bestätigt, {c.get('corrected', 0)} ergänzt"
+                     + (f", {c['conflict']} Widersprüche bleiben zur Prüfung liegen"
+                        if c.get("conflict") else ""))
+            problems = research_status_text(getattr(self, "research_status", {}))
+            if problems:
+                check += f"\n⚠ Nicht vollständig: {problems}"
+        else:
+            check = "Recherche ist ausgeschaltet – nur lokal geprüft."
         if not self.confirm("In Boxen sortieren",
                             f"{n} Objekte in {len(groups)} Glas-Boxen auf dem Desktop "
-                            f"einsortieren?\n\nMit „Rückgängig“ jederzeit umkehrbar."):
+                            f"einsortieren?\n\n{check}\n\nMit „Rückgängig“ jederzeit umkehrbar."):
             return
         self.memory.save()
         try:
@@ -10417,8 +10705,8 @@ class MainWindow(_Base):
             e.ignore()
             self.hide()
         else:
-            if self._online:
-                self._online.cancel = True
+            if self._research:
+                self._research.cancel = True
             super().closeEvent(e)
 
     # ---------- Dialoge ----------
@@ -11608,13 +11896,20 @@ class FenceManager(QObject):
         if memory:
             rules = rules + memory.rules()
 
+        research_on, sources = research_settings(self.cfg)
+
         def job():
-            out = []
-            for it in inspect_paths(cands):
+            items = inspect_paths(cands)
+            for it in items:
                 classify(it, rules, memory)
-                if it.confidence in ("high", "medium", "user") and it.category in targets:
-                    out.append((str(it.path), it.category))
-            return out
+            if research_on and sources:          # auch hier: erst prüfen, dann einsortieren
+                cache = research_cache_load()
+                results, _ = research_run(research_targets(items), cache, sources=sources)
+                research_cache_save(cache)
+                for it in items:
+                    research_apply(it, results.get(str(it.path)), memory.alias if memory else None)
+            return [(str(it.path), it.category) for it in items
+                    if it.confidence in ("high", "medium", "user") and it.category in targets]
 
         def done(pairs):
             for path, cat in pairs:
@@ -13533,7 +13828,6 @@ def main():
     ap.add_argument("--desktop", type=Path, help="anderen Ordner sortieren (Test)")
     ap.add_argument("--rules", type=Path, default=DEFAULT_RULES)
     ap.add_argument("--memory", type=Path, default=DEFAULT_MEMORY)
-    ap.add_argument("--model", default="claude-opus-5-5")
     ap.add_argument("--min-group", type=int, default=2)
     ap.add_argument("--storage", type=Path, default=STORAGE_DIR,
                     help="Ordner mit dem Inhalt der Glas-Boxen")
