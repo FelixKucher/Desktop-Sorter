@@ -191,7 +191,8 @@ QMessageBox.question = staticmethod(lambda *a, **k: answers["q"])
 QMessageBox.information = staticmethod(lambda *a, **k: print("   ℹ", (a[2] if len(a) > 2 else "").splitlines()[0][:110]))
 QMessageBox.warning = staticmethod(lambda *a, **k: print("   ⚠", (a[2] if len(a) > 2 else "")[:300]))
 
-win = g.OrganizerWindow(fm, ROOT)
+fm.cfg["research"] = {"on": False}       # Recherche testet test_app_pages.py (simuliert)
+win = g.OrganizerView(fm, ROOT)
 win.resize(1240, 860)
 win.show()
 
@@ -302,7 +303,7 @@ def s5():
     touch(dl / "foto.jpg", b"\xff\xd8" + b"\0" * 900, 3)
     shutil.copy2(dl / "foto.jpg", dl / "foto (1).jpg")
     touch(dl / "notizen.txt", b"Einkaufsliste", 8)
-    cw = g.CleanerWindow(fm, dl)
+    cw = g.CleanerView(fm, dl)
     cw.resize(620, 820)
     cw.show()
 

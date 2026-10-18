@@ -71,7 +71,7 @@ class OrgTile(QAbstractButton):
         self.value, self.sub = "–", ""
         self.setCheckable(True)
         self.setCursor(Qt.PointingHandCursor)
-        self.setMinimumSize(170, 92)
+        self.setMinimumSize(138, 92)
         self._hover = False
 
     def set_value(self, value: str, sub: str = ""):
@@ -97,7 +97,8 @@ class OrgTile(QAbstractButton):
         p.setFont(f)
         p.setPen(self.color.lighter(140))
         p.drawText(QRectF(16, 12, r.width() - 24, 20), Qt.AlignLeft | Qt.AlignVCenter,
-                   f"{self.glyph}  {self.title}")
+                   p.fontMetrics().elidedText(f"{self.glyph}  {self.title}", Qt.ElideRight,
+                                              int(r.width() - 26)))
         f.setPixelSize(26)
         f.setWeight(QFont.Bold)
         p.setFont(f)
@@ -114,6 +115,7 @@ class OrgTile(QAbstractButton):
 ORG_SECTIONS = [
     # Schlüssel, Titel, Symbol, Farbe
     ("moves", "Neue Ordnung", "🗂", "#0A84FF"),
+    ("research", "Recherche", "🔎", "#5E5CE6"),
     ("protect", "Wichtig & dauerhaft", "🔒", "#30D158"),
     ("dups", "Duplikate", "⧉", "#FF9F0A"),
     ("versions", "Alte Versionen", "🕘", "#BF5AF2"),
@@ -123,44 +125,108 @@ ORG_SECTIONS = [
 ]
 
 
-class OrganizerWindow(_Base):
-    """Analysiert einen beliebigen Ordner, schlägt Ordnung vor und räumt sicher auf."""
+ORG_QUICK_FOLDERS = [("🖥", "Desktop", "desktop"), ("📄", "Dokumente", "documents"),
+                     ("⬇", "Downloads", "downloads"), ("🖼", "Bilder", "pictures"),
+                     ("🎬", "Videos", "videos"), ("🎵", "Musik", "music")]
 
-    def __init__(self, mgr: "FenceManager", folder: Path):
-        super().__init__()
+
+def org_move_into(files: list, dest: Path) -> tuple:
+    """Dateien in einen anderen Ordner legen (nie überschreiben). Protokoll im Format von
+    org_undo, damit „Letzte Sortierung rückgängig“ auch das zurücknimmt.
+    → (Anzahl, Fehlermeldungen, Protokoll oder None bei verschiedenen Laufwerken)."""
+    dest = Path(dest)
+    moves, failed = [], []
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        root = Path(os.path.commonpath([str(dest)] + [str(Path(f.path).parent) for f in files]))
+    except ValueError:                                   # anderes Laufwerk
+        root = None
+    except OSError as e:
+        return 0, [f"{dest}: {e.strerror or e}"], None
+    journal = None
+    if root is not None:
+        JOURNAL_DIR.mkdir(exist_ok=True)
+        stamp, n = time.strftime("%Y%m%d-%H%M%S"), 1
+        journal = JOURNAL_DIR / f"organize-{stamp}.json"
+        while journal.exists():
+            n += 1
+            journal = JOURNAL_DIR / f"organize-{stamp}-{n}.json"
+    for f in files:
+        src = Path(f.path)
+        if not src.is_file():
+            failed.append(f"{src.name}: nicht mehr vorhanden")
+            continue
+        if src.parent == dest:
+            continue
+        target = unique_dest(dest, src.name)
+        try:
+            shutil.move(str(src), str(target))
+        except OSError as e:
+            failed.append(f"{src.name}: {e.strerror or e}")
+            continue
+        moves.append([str(src), str(target)])
+        if journal:
+            journal.write_text(json.dumps({"root": str(root), "created": [], "moves": moves},
+                                          ensure_ascii=False, indent=1), encoding="utf-8")
+    return len(moves), failed, journal
+
+
+def org_research_dest(f, category: str) -> str:
+    """Zielordner nach der Recherche: Installer und Archive nach Thema
+    („Programme & Installer/Spiele“), Unbekanntes unter „Sonstiges/<Thema>“."""
+    base = org_dest_for(f)
+    if not category:
+        return base
+    if f.kind in ("installer", "archive") or not base:
+        return f"{base or 'Sonstiges'}/{category}"
+    return base
+
+
+class OrganizerView(QWidget):
+    """Analysiert einen beliebigen Ordner, schlägt Ordnung vor und räumt sicher auf –
+    mit Recherche zu Installern, Archiven, Videos & Co. Seite im Hauptfenster."""
+
+    def __init__(self, mgr: "FenceManager", folder: Path, autostart=True, boxes_fn=None,
+                 parent=None):
+        super().__init__(parent)
         self.mgr, self.folder = mgr, Path(folder)
         self.plan = None
+        self.boxes_fn = boxes_fn                       # → {Name: Ordner} der Desktop-Boxen
+        self.on_swipe = None                           # fn(Dateien, Titel, Plan) im Hauptfenster
+        self.research: dict[str, dict] = {}           # Pfad → Ergebnis der Recherche
+        self._research: ResearchJob | None = None
         self._worker: OrgWorker | None = None
         self.setWindowTitle("Ordner-Assistent")
-        self.setWindowIcon(app_icon())
-        if FRAMELESS:
-            self.setTitleBar(TitleBar(self))
-            for b in (self.titleBar.minBtn, self.titleBar.maxBtn, self.titleBar.closeBtn):
-                b.setNormalColor(QColor(255, 255, 255, 200))
-                b.setHoverColor(Qt.white)
-        if ACRYLIC:
-            self.windowEffect.setAcrylicEffect(self.winId(), ACRYLIC_TINT)
         self._build()
         self.resize(1240, 860)
-        QTimer.singleShot(0, self.analyze)
+        if autostart:
+            QTimer.singleShot(0, self.analyze)
 
     # ---------- Aufbau ----------
     def _build(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(22, 40 if FRAMELESS else 22, 22, 18)
+        root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(12)
 
         head = QHBoxLayout()
         titles = QVBoxLayout()
         titles.setSpacing(2)
-        t = QLabel("Ordner-Assistent")
-        t.setObjectName("h1")
-        self.sub = QLabel("")
+        self.title_lbl = ElideLabel("📁  Ordner-Assistent")
+        self.title_lbl.setObjectName("h2")
+        self.sub = ElideLabel("")
         self.sub.setObjectName("sub")
-        titles.addWidget(t)
+        titles.addWidget(self.title_lbl)
         titles.addWidget(self.sub)
-        head.addLayout(titles)
-        head.addStretch(1)
+        head.addLayout(titles, 1)
+        self.quick: dict[str, GlassButton] = {}
+        for glyph, label, key in ORG_QUICK_FOLDERS:
+            b = GlassButton(f"{glyph}  {label}", small=True)
+            b.clicked.connect(lambda _=False, k=key: self.set_folder(org_known_folder(k)))
+            self.quick[key] = b
+            head.addWidget(b)
+        head.addSpacing(10)
+        root.addLayout(head)
+        head = QHBoxLayout()
         self.t_recursive = Toggle("Unterordner einbeziehen", checked=True)
         self.t_reorg = Toggle("Unterordner neu ordnen")
         self.t_recursive.toggled.connect(lambda _: self.analyze())
@@ -172,6 +238,7 @@ class OrganizerWindow(_Base):
         for w in (self.t_recursive, self.t_reorg):
             head.addWidget(w)
             head.addSpacing(8)
+        head.addStretch(1)
         head.addWidget(self.b_folder)
         head.addWidget(self.b_again)
         root.addLayout(head)
@@ -249,7 +316,7 @@ class OrganizerWindow(_Base):
         root.addWidget(self.panel, 1)
         self.current = "moves"
         self.busy_widgets = [self.b_folder, self.b_again, self.t_recursive, self.t_reorg,
-                             self.panel] + list(self.tiles.values())
+                             self.panel] + list(self.tiles.values()) + list(self.quick.values())
 
     def _make_tree(self) -> QTreeWidget:
         t = QTreeWidget()
@@ -272,8 +339,18 @@ class OrganizerWindow(_Base):
         return t
 
     def paintEvent(self, _):
-        p = QPainter(self)
-        paint_backdrop(p, self.rect(), overlay_only=ACRYLIC)
+        if self.isWindow():                  # nur als eigenes Fenster (Tests)
+            p = QPainter(self)
+            paint_backdrop(p, self.rect(), overlay_only=False)
+
+    def set_folder(self, folder: Path):
+        if self._worker and self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait(3000)
+        self.folder = Path(folder)
+        self.plan = None
+        self.populate()
+        self.analyze()
 
     # ---------- Analyse ----------
     def _protected(self) -> set:
@@ -303,7 +380,11 @@ class OrganizerWindow(_Base):
                                protected_paths=protected)
 
         self.set_busy("Analysiere …")
-        self.sub.setText(f"{self.folder.name or self.folder}")
+        if self._research:
+            self._research.cancel = True
+        self.research = {}
+        self.title_lbl.setText(f"📁  {self.folder.name or self.folder}")
+        self.sub.setText(str(self.folder))
         self.sub.setToolTip(str(self.folder))
         self._worker = OrgWorker(job, self)
         self._worker.progress.connect(self._on_progress)
@@ -332,9 +413,58 @@ class OrganizerWindow(_Base):
         st = plan.stats
         note = "  ·  ⚠ nur die ersten Dateien analysiert" if plan.truncated else ""
         self.sub.setToolTip(str(self.folder))
-        self.sub.setText(f"{self.folder.name or self.folder}  ·  {st.get('files', len(plan.files)):,} Dateien  ·  "
-                         f"{human_size(st.get('bytes', 0))}  ·  {st.get('seconds', 0):.1f} s"
-                         .replace(",", ".") + note)
+        self.sub.setText(f"{self.folder}  ·  {st.get('files', len(plan.files)):,} Dateien  ·  "
+                         f"{human_size(st.get('bytes', 0)).replace(',', '#')}  ·  "
+                         f"{st.get('seconds', 0):.1f} s".replace(",", ".").replace("#", ",")
+                         + note)
+        self.populate()
+        self._start_research()
+
+    # ---------- Recherche ----------
+    def _research_files(self) -> list:
+        return [f for f in self.plan.files if research_file_ok(f) and research_file_query(f.path)]
+
+    def _start_research(self):
+        on, srcs = research_settings(self.mgr.cfg)
+        files = self._research_files() if self.plan else []
+        if not (on and srcs and files):
+            self.tiles["research"].set_value("–", "Recherche aus" if not (on and srcs)
+                                             else "nichts nachzuschlagen")
+            return
+        if self._research:
+            self._research.cancel = True
+        items = [Item(f.path, "user", "file") for f in files]
+        self._research = job = ResearchJob(items, srcs, self,
+                                           query_fn=lambda it: research_file_query(it.path))
+        job.progress.connect(lambda n, total, name: job is self._research and
+                             self.tiles["research"].set_value(f"{n}/{total}", f"prüfe „{name}“ …"))
+        job.finished.connect(lambda res, st, j=job: self._research_done(j, res, st))
+        self.tiles["research"].set_value("…", f"{len(files)} Dateien werden geprüft")
+        job.start()
+
+    def _research_done(self, job, results: dict, status: dict):
+        if job is not self._research or job.cancel or self.plan is None:
+            return
+        self._research = None
+        self.research = results
+        self.research_status = status
+        by_path = {str(f.path): f for f in self.plan.files}
+        for path, res in results.items():
+            f = by_path.get(path)
+            if f is None or not res.get("evidence"):
+                continue
+            first = res["evidence"][0]
+            f.add_reason(f"🔎 {first['label']} – {first['text']}"
+                         + (f" ({', '.join(res['agree'])})" if res.get("agree") else ""))
+            dest = org_research_dest(f, res.get("category", ""))
+            parent = Path(f.rel).parent.as_posix()
+            if dest and not (parent == dest or parent.startswith(dest + "/")) \
+                    and f.tier != ORG_JUNK:
+                old = next((m for m in self.plan.moves if m.file is f), None)
+                if old:
+                    old.dest_rel = dest
+                else:
+                    self.plan.moves.append(OrgMove(f, dest, False))
         self.populate()
 
     # ---------- Darstellung ----------
@@ -382,6 +512,27 @@ class OrganizerWindow(_Base):
                 it.setData(1, Qt.UserRole, i)
                 g.addChild(it)
             g.setExpanded(len(groups) <= 12)
+        # Recherche – nach Thema laut offenen Quellen
+        t = self.trees["research"]
+        by_path = {str(f.path): f for f in plan.files}
+        topics: dict[str, list] = {}
+        for path, res in self.research.items():
+            f = by_path.get(path)
+            if f is not None:
+                topics.setdefault(res.get("category") or ("Gefunden, ohne Thema"
+                                  if res.get("evidence") else "Kein Treffer"), []).append((f, res))
+        order = sorted(topics, key=lambda k: (k in ("Gefunden, ohne Thema", "Kein Treffer"), k))
+        for topic in order:
+            g = self._group_item(t, f"🔎  {topic}", f"{len(topics[topic])} Datei(en)")
+            for f, res in sorted(topics[topic], key=lambda fr: fr[0].rel.lower()):
+                lines = research_lines(res)
+                it = self._file_item(f, bool(res.get("category")) and f.tier != ORG_JUNK,
+                                     lines[0] if lines else "in keiner Quelle gefunden")
+                it.setToolTip(1, "\n".join(lines) or "in keiner Quelle gefunden")
+                dest = org_research_dest(f, res.get("category", ""))
+                it.setData(1, Qt.UserRole + 3, dest)
+                g.addChild(it)
+            g.setExpanded(len(order) <= 8)
         # Wichtig – nach Kategorie
         t = self.trees["protect"]
         cats: dict[str, list] = {}
@@ -464,6 +615,9 @@ class OrganizerWindow(_Base):
         rest = [f for f in p.junk if not f.dup_of]
         olds = [f for g in p.versions.values() for f in g if not f.version_latest]
         self.tiles["moves"].set_value(str(len(p.moves)), f"in {len({m.dest_rel for m in p.moves})} Ordner")
+        if self.research:
+            found = sum(1 for r in self.research.values() if r.get("category"))
+            self.tiles["research"].set_value(str(found), f"von {len(self.research)} zugeordnet")
         self.tiles["protect"].set_value(str(len(p.protect)), "nie zum Löschen vorgeschlagen")
         self.tiles["dups"].set_value(human_size(sum(f.size for f in dup_copies)),
                                      f"{len(dup_copies)} Kopien")
@@ -475,6 +629,11 @@ class OrganizerWindow(_Base):
             p.files, key=lambda f: -f.size)[:60])), "die 60 größten")
 
     SECTION_INFO = {
+        "research": ("Recherche in offenen Quellen",
+                     "Installer, Archive, Videos, Musik und Unbekanntes werden in Wikidata, "
+                     "Wikipedia, Flathub und Chocolatey nachgeschlagen (nur der bereinigte Name; "
+                     "nie Dokumente oder Fotos). Häkchen = nach Thema einsortieren.",
+                     "Ausgewählte nach Thema einsortieren", "Ausgewählte in den Papierkorb"),
         "moves": ("Vorgeschlagene Ordnung",
                   "Dateien werden innerhalb dieses Ordners in Unterordner verschoben – nichts wird gelöscht. "
                   "Häkchen = übernehmen. Rückgängig jederzeit möglich.",
@@ -543,6 +702,11 @@ class OrganizerWindow(_Base):
         key = self.current
         if key == "moves":
             return self.apply_moves()
+        if key == "research":
+            files = self._checked_files("research")
+            if secondary:
+                return self.trash(files)
+            return self.apply_research_moves()
         if key == "protect":
             return self.remember_protected() if secondary else self.backup_vault()
         files = self._checked_files(key)
@@ -571,6 +735,48 @@ class OrganizerWindow(_Base):
         if failed:
             msg += "\n\nNicht verschoben:\n" + "\n".join(failed[:15])
         QMessageBox.information(self, "Ordner-Assistent", msg)
+        self.analyze()
+
+    def apply_research_moves(self):
+        moves = [OrgMove(it.data(0, Qt.UserRole), it.data(1, Qt.UserRole + 3), True)
+                 for it in self._iter_items(self.trees["research"])
+                 if it.data(0, Qt.UserRole) is not None and it.checkState(0) == Qt.Checked
+                 and it.data(1, Qt.UserRole + 3)]
+        moves = [m for m in moves if Path(m.file.rel).parent.as_posix() != m.dest_rel]
+        if not moves:
+            return QMessageBox.information(self, "Ordner-Assistent", "Nichts ausgewählt.")
+        if QMessageBox.question(self, "Nach Thema einsortieren",
+                                f"{len(moves)} Datei(en) in {len({m.dest_rel for m in moves})} "
+                                f"Ordner einsortieren?\n\nRückgängig jederzeit möglich.") \
+                != QMessageBox.Yes:
+            return
+        JOURNAL_DIR.mkdir(exist_ok=True)
+        journal = JOURNAL_DIR / f"organize-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        moved, failed = org_apply_moves(self.plan, moves, journal)
+        msg = f"{moved} Dateien einsortiert."
+        if failed:
+            msg += "\n\nNicht verschoben:\n" + "\n".join(failed[:15])
+        QMessageBox.information(self, "Ordner-Assistent", msg)
+        self.analyze()
+
+    def move_files(self, files: list, dest: Path):
+        """Einordnen in einen anderen Ordner (Dokumente, Bilder, Desktop-Box …)."""
+        files = [f for f in files if not f.in_project]
+        if not files:
+            return
+        same_drive = os.path.splitdrive(str(dest))[0].lower() == \
+            os.path.splitdrive(str(self.folder))[0].lower()
+        if QMessageBox.question(self, "Verschieben",
+                                f"{len(files)} Datei(en) nach\n{dest}\nverschieben?"
+                                + ("" if same_drive else "\n\nAnderes Laufwerk – wird kopiert "
+                                   "und kann nicht automatisch rückgängig gemacht werden.")) \
+                != QMessageBox.Yes:
+            return
+        moved, failed, _journal = org_move_into(files, dest)
+        msg = f"{moved} Datei(en) verschoben nach {dest}."
+        if failed:
+            msg += "\n\nNicht verschoben:\n" + "\n".join(failed[:15])
+        QMessageBox.information(self, "Verschieben", msg)
         self.analyze()
 
     def trash(self, files: list, dirs: list = ()):
@@ -654,8 +860,11 @@ class OrganizerWindow(_Base):
         files = [f for f in files if f.tier != ORG_PROTECT or f.dup_of]
         if not files:
             return
-        win = CleanerWindow(self.mgr, self.folder, entries=[f.path for f in files],
-                            title=self.SECTION_INFO[self.current][0], hints=self.plan)
+        title = self.SECTION_INFO[self.current][0]
+        if self.on_swipe:                              # im Hauptfenster: Seite „Aufräumen“
+            return self.on_swipe([f.path for f in files], title, self.plan)
+        win = CleanerView(self.mgr, self.folder, entries=[f.path for f in files],
+                          title=title, hints=self.plan)
         win.destroyed.connect(self._after_swipe)
         win.setAttribute(Qt.WA_DeleteOnClose)
         win.show()
@@ -690,8 +899,7 @@ class OrganizerWindow(_Base):
     def choose_folder(self):
         d = QFileDialog.getExistingDirectory(self, "Ordner analysieren", str(self.folder))
         if d:
-            self.folder = Path(d)
-            self.analyze()
+            self.set_folder(Path(d))
 
     # ---------- Kontextmenü ----------
     def _open_item(self, it, _col=0):
@@ -705,8 +913,19 @@ class OrganizerWindow(_Base):
         if f is None:
             return
         m = glass_menu(self)
+        sel = [x.data(0, Qt.UserRole) for x in tree.selectedItems()
+               if x.data(0, Qt.UserRole) is not None]
+        files = sel if f in sel else [f]
         m.addAction("▶  Öffnen", lambda: self.mgr.launch(str(f.path)))
         m.addAction("↗  Im Explorer zeigen", lambda: reveal_path(str(f.path)))
+        res = self.research.get(str(f.path))
+        if res and res.get("evidence"):
+            info = m.addAction("🔎  " + research_lines(res)[0][:90])
+            info.setEnabled(False)
+        m.addSeparator()
+        m.addMenu(self._move_menu(m, files))
+        m.addAction(f"🗑  In den Papierkorb …" + (f" ({len(files)})" if len(files) > 1 else ""),
+                    lambda: self.trash(files))
         m.addSeparator()
         cat = glass_menu(m, "Kategorie ändern")
         for key, c in ORG_CATEGORIES.items():
@@ -721,6 +940,34 @@ class OrganizerWindow(_Base):
                     lambda: self.toggle_protect(f, not prot))
         m.addAction("🚫  Nicht anfassen (ausblenden)", lambda: self.ignore(f))
         m.exec(tree.viewport().mapToGlobal(pos))
+
+    def _move_menu(self, parent: QMenu, files: list) -> QMenu:
+        """„Verschieben nach“: Zielordner aus dem Plan, Standardordner, Desktop-Boxen."""
+        mm = glass_menu(parent, "📦  Verschieben nach")
+        if self.plan is not None:
+            dests = sorted({org_dest_for(f) for f in files if org_dest_for(f)})
+            for d in dests:
+                mm.addAction(f"🗂  {d}  (hier)", lambda d=d: self.move_files(files, self.folder / d))
+            if dests:
+                mm.addSeparator()
+        for glyph, label, key in ORG_QUICK_FOLDERS:
+            target = org_known_folder(key)
+            if os.path.normcase(str(target)) != os.path.normcase(str(self.folder)):
+                mm.addAction(f"{glyph}  {label}", lambda t=target: self.move_files(files, t))
+        boxes = self.boxes_fn() if self.boxes_fn else {}
+        if boxes:
+            bm = glass_menu(mm, "▣  Desktop-Box")
+            for name, folder in boxes.items():
+                bm.addAction(name, lambda d=folder: self.move_files(files, d))
+            mm.addMenu(bm)
+        mm.addSeparator()
+        mm.addAction("Anderer Ordner …", lambda: self._move_pick(files))
+        return mm
+
+    def _move_pick(self, files: list):
+        d = QFileDialog.getExistingDirectory(self, "Zielordner wählen", str(self.folder))
+        if d:
+            self.move_files(files, Path(d))
 
     def recategorize(self, f: OrgFile, key: str):
         f.category = key
@@ -768,6 +1015,8 @@ class OrganizerWindow(_Base):
         if self._worker and self._worker.isRunning():
             self._worker.cancel()
             self._worker.wait(3000)
+        if self._research:
+            self._research.cancel = True
         super().closeEvent(e)
 
 

@@ -569,7 +569,9 @@ ONLINE_RULES: list[tuple[str, str]] = [
                         r"vektorgrafik|vector graphics|fotobearbeitung|photo editing|"
                         r"image manipulation"),
     ("Musik & Video", r"mediaplayer|media player|musik-?streaming|music streaming|"
-                      r"videobearbeitung|video editing|audio editor|streaming"),
+                      r"videobearbeitung|video editing|audio editor|streaming|\bfilm\b|"
+                      r"spielfilm|fernsehserie|tv series|television series|\bmovie\b|"
+                      r"studioalbum|\balbum\b|\bsong\b|\blied\b|hörbuch|audiobook|podcast"),
     ("Hardware & Peripherie", r"treiber|\bdriver|peripher|\brgb\b|mainboard|motherboard|"
                               r"\bmaus\b|\bmouse\b|\bmice\b|tastatur|keyboard|drucker|printer|"
                               r"grafikkarte|graphics card"),
@@ -893,16 +895,19 @@ RESEARCH_FUNCS = {"wikidata": research_wikidata, "wikipedia": research_wikipedia
 
 
 def research_run(items: list[Item], cache: dict, fetch=None, sources=None, progress=None,
-                 stop=lambda: False, force: bool = False, pauses: dict | None = None):
+                 stop=lambda: False, force: bool = False, pauses: dict | None = None,
+                 query_fn=None, check_binaries: bool = True):
     """Alle Namen in allen Quellen nachschlagen – je Server ein eigener Strang mit
     Pause zwischen den Anfragen, Wikipedia nur, wenn Wikidata nichts findet.
+    query_fn(Item) → Suchbegriff (Standard: bereinigter Anzeigename).
     → ({Pfad: Ergebnis}, {Quelle: "ok" | "limit" | "offline"})."""
     from urllib.error import HTTPError
     fetch = fetch or _online_fetch
+    query_fn = query_fn or (lambda it: online_clean_name(it.label))
     sources = [s for s in (sources or list(RESEARCH_SOURCES)) if s in RESEARCH_FUNCS]
     queries: dict[str, str] = {}
     for it in items:
-        q = online_clean_name(it.label)
+        q = query_fn(it)
         if q:
             queries.setdefault(q.casefold(), q)
     lanes = [[s for s in ("wikidata", "wikipedia") if s in sources]]
@@ -983,17 +988,59 @@ def research_run(items: list[Item], cache: dict, fetch=None, sources=None, progr
                 break
     results = {}
     for it in items:
-        q = online_clean_name(it.label)
+        q = query_fn(it)
         if not q:
             continue
         need = RESEARCH_MIN_COVER_FOLDER if it.kind == "folder" else RESEARCH_MIN_COVER
         ev = [e for s in sources if (e := evidence.get(q.casefold(), {}).get(s))
               and e.get("cover", 1.0) >= need]
         res = research_combine(ev)
-        if it.kind == "folder" and res["category"]:
+        res["query"] = q
+        if check_binaries and it.kind == "folder" and res["category"]:
             res["binaries"] = folder_has_binaries(it.path)
         results[str(it.path)] = res
     return results, status
+
+
+# Dateien: Rauschen in Namen von Downloads (Versionen, Plattform, Video-Release-Tags …)
+RESEARCH_FILE_NOISE = re.compile(
+    r"\b(v?\d+([._ ]\d+)*[a-z]?|x64|x86|amd64|arm64|win(dows)?(32|64)?|(32|64) ?bit|"
+    r"((user|system) ?)?setup|install(er)?|"
+    r"portable|release|final|full|latest|stable|beta|alpha|rc\d*|build|update|patch|offline|"
+    r"online|multi|multilang|german|deutsch|ger|eng|english|dl|\d{3,4}p|4k|uhd|hdr|"
+    r"x26[45]|h26[45]|hevc|avc|aac|ac3|dts|bluray|blu ray|bdrip|brrip|web ?dl|webrip|dvdrip|"
+    r"hdtv|remux|proper|repack|extended|uncut|imax|mp3|flac|320kbps)\b", re.I)
+RESEARCH_FILE_SKIP = re.compile(
+    r"^(img|dsc|dscn|pxl|vid|mvimg|screenshot|screen ?shot|bildschirmfoto|whatsapp|signal|"
+    r"telegram|scan|scanned|image|bild|foto|photo|video|audio|download|file|datei|dokument|"
+    r"document|untitled|unbenannt|neu|new|kopie|copy|temp|tmp|test|export|backup|sicherung)\b",
+    re.I)
+RESEARCH_FILE_KINDS = {"installer", "archive", "video", "audio", "cad", "other"}
+
+
+def research_file_query(path: Path) -> str:
+    """Suchbegriff aus einem Dateinamen: „SteamSetup.exe“ → „Steam“,
+    „Interstellar.2014.1080p.BluRay.x264.mkv“ → „Interstellar“; „IMG_0001.jpg“ → ""."""
+    stem = re.sub(r"\.(tar)$", "", Path(path).stem, flags=re.I)
+    stem = re.sub(r"(?<=[a-z])(?=(User|System)?Setup|Installer)", " ", stem)   # SteamSetup → Steam Setup
+    s = re.sub(r"\(.*?\)|\[.*?\]|\{.*?\}", " ", stem)
+    s = re.sub(r"[_\-.+]+", " ", s)
+    s = RESEARCH_FILE_NOISE.sub(" ", s)
+    s = re.sub(r"\b(19|20)\d{2}\b.*$", " ", s)          # ab der Jahreszahl: Release-Kram
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s or RESEARCH_FILE_SKIP.match(s):
+        return ""
+    return online_clean_name(s)
+
+
+def research_file_ok(f) -> bool:
+    """Datei darf nachgeschlagen werden? Nie Wichtiges/Persönliches, nie Fotos, nie
+    Dokumente außer Anleitungen, nie Projekt- oder „nur online“-Dateien."""
+    if getattr(f, "tier", "") == ORG_PROTECT or getattr(f, "in_project", False) \
+            or getattr(f, "cloud", False):
+        return False
+    kind, cat = getattr(f, "kind", ""), getattr(f, "category", "")
+    return kind in RESEARCH_FILE_KINDS or (kind == "document" and cat == "manual")
 
 
 def research_status_text(status: dict) -> str:
@@ -1032,6 +1079,252 @@ def research_settings(cfg: dict | None) -> tuple[bool, list[str]]:
     r = (cfg or {}).get("research") or {}
     srcs = [s for s in r.get("sources", list(RESEARCH_SOURCES)) if s in RESEARCH_SOURCES]
     return bool(r.get("on", True)), srcs
+
+
+# --------------------------------------------------------------------------- #
+# Speicher-Analyse – die größten Platzfresser je Laufwerk
+# --------------------------------------------------------------------------- #
+STORAGE_TOP = 20
+STORAGE_KEEP = 32 * 1024 ** 2        # kleinere Ordner/Dateien zählen nur in der Summe
+# Sammelordner: werden aufgelöst, damit „World of Warcraft“ statt „Program Files“ erscheint
+STORAGE_CONTAINERS = {
+    "program files", "program files (x86)", "programdata", "users", "benutzer", "home",
+    "appdata", "local", "roaming", "locallow", "programs", "packages",
+    "games", "spiele", "steamlibrary", "steam", "steamapps", "common", "epic games",
+    "xboxgames", "gog galaxy", "gog games", "riot games", "ea games", "ubisoft",
+    "ubisoft game launcher", "rockstar games", "my games", "documents", "dokumente",
+    "eigene dateien", "onedrive"}
+STORAGE_PROFILE_PARENTS = {"users", "benutzer", "home"}
+# Kinder dieser Ordner sind Programme bzw. App-Daten („Docker“, „Google“) → als Einheit zeigen
+STORAGE_UNIT_PARENTS = {"local", "roaming", "locallow", "programdata", "program files",
+                        "program files (x86)", "packages", "programs"}
+_STORAGE_GENERIC = re.compile(
+    r"^(bin\d*|x64|x86|win(32|64)|(32|64) ?bit|amd64|arm64|apps?|application|programs?|data|"
+    r"game|common\d*|ide|libs?|current|release|content|resources|v?\d+([.\-_]\d+)*)$", re.I)
+STORAGE_GAME_PARENTS = {"common", "steamapps", "steamlibrary", "epic games", "xboxgames",
+                        "gog games", "riot games", "ea games", "games", "spiele", "my games",
+                        "rockstar games", "ubisoft game launcher"}
+STORAGE_SYSTEM_FILES = {"pagefile.sys": "Auslagerungsdatei (Windows)",
+                        "hiberfil.sys": "Ruhezustand (Windows)",
+                        "swapfile.sys": "Auslagerung für Apps (Windows)",
+                        "memory.dmp": "Absturzabbild (Windows)"}
+STORAGE_SPECIAL_DIRS = {"windows": ("System", "Windows (System)"),
+                        "windows.old": ("System", "Alte Windows-Installation"),
+                        "$recycle.bin": ("Papierkorb", "Papierkorb"),
+                        "system volume information": ("System", "Wiederherstellungspunkte"),
+                        "$windows.~bt": ("System", "Windows-Update-Reste"),
+                        "$winreagent": ("System", "Windows-Update-Reste")}
+STORAGE_TEMP_DIRS = {"temp", "tmp", "cache", "caches", "crashdumps", "package cache"}
+STORAGE_KIND_COLORS = {"Spiel": "#FF9F0A", "Programm": "#0A84FF", "System": "#8E8E93",
+                       "App-Daten": "#5E5CE6",
+                       "Benutzerordner": "#30D158", "Ordner": "#64D2FF", "Projekt": "#BF5AF2",
+                       "Video": "#FF375F", "Archiv": "#FFD60A", "Installer": "#FFD60A",
+                       "Temporär": "#FF453A", "Papierkorb": "#FF453A", "Datei": "#AC8E68"}
+_STORAGE_REPARSE = 0x400
+_STORAGE_LINK_TAGS = (0xA0000003, 0xA000000C)        # Junction, Symlink → am Ziel gezählt
+_STORAGE_CLOUD = 0x400000 | 0x40000 | 0x1000         # OneDrive „nur online“: belegt nichts
+
+
+class StorageNode:
+    __slots__ = ("name", "path", "size", "is_dir", "children", "exe_depth", "parent_name",
+                 "files", "denied", "cloud", "project")
+
+    def __init__(self, name: str, path: str, is_dir: bool, parent_name: str = ""):
+        self.name, self.path, self.is_dir, self.parent_name = name, path, is_dir, parent_name
+        self.size = self.files = self.denied = self.cloud = 0
+        self.children: list = []
+        self.exe_depth = 99             # Abstand zur nächsten .exe/.dll (0 = direkt darin)
+        self.project = False
+
+
+def storage_scan(root, progress=None, stop=lambda: False, keep: int = STORAGE_KEEP) -> StorageNode:
+    """Belegung unter root. Junctions/Symlinks werden nicht doppelt gezählt, OneDrive-Dateien
+    „nur online“ belegen nichts. progress(Dateien, aktueller Ordner) etwa alle 0,2 s."""
+    seen = [0, time.monotonic()]
+    root = str(root)
+
+    def walk(path: str, name: str, parent: str, depth: int) -> StorageNode:
+        node = StorageNode(name, path, True, parent)
+        try:
+            entries = os.scandir(path)
+        except OSError:
+            node.denied = 1
+            return node
+        with entries:
+            for e in entries:
+                if stop():
+                    break
+                try:
+                    st = e.stat(follow_symlinks=False)
+                    is_dir = e.is_dir(follow_symlinks=False)
+                except OSError:
+                    node.denied += 1
+                    continue
+                attrs = getattr(st, "st_file_attributes", 0)
+                if e.is_symlink() or (attrs & _STORAGE_REPARSE and is_dir and
+                                      getattr(st, "st_reparse_tag", 0) in _STORAGE_LINK_TAGS):
+                    continue
+                low = e.name.lower()
+                if is_dir:
+                    if low in ORG_PROJECT_STRONG:
+                        node.project = True
+                    if depth >= 200:
+                        continue
+                    child = walk(e.path, e.name, name, depth + 1)
+                    node.size += child.size
+                    node.files += child.files
+                    node.denied += child.denied
+                    node.cloud += child.cloud
+                    node.exe_depth = min(node.exe_depth, child.exe_depth + 1)
+                    if child.size >= keep:
+                        node.children.append(child)
+                    continue
+                node.files += 1
+                seen[0] += 1
+                if progress and seen[0] % 500 == 0 and time.monotonic() - seen[1] > 0.2:
+                    seen[1] = time.monotonic()
+                    progress(seen[0], path)
+                if attrs & _STORAGE_CLOUD:
+                    node.cloud += st.st_size
+                    continue
+                node.size += st.st_size
+                if os.path.splitext(low)[1] in PROGRAM_EXTS or low in PROGRAM_MARKERS:
+                    node.exe_depth = 0
+                if low.endswith((".sln", ".csproj", ".vcxproj")) or low in ORG_PROJECT_STRONG:
+                    node.project = True
+                if st.st_size >= keep:
+                    f = StorageNode(e.name, e.path, False, name)
+                    f.size, f.files = st.st_size, 1
+                    node.children.append(f)
+        return node
+
+    out = walk(root, root, "", 0)
+    if progress:
+        progress(seen[0], root)
+    return out
+
+
+def storage_is_program(node: StorageNode, install_dirs=frozenset()) -> bool:
+    low = node.name.lower()
+    if not node.is_dir or low in ORG_USER_DIR_NAMES or low in STORAGE_CONTAINERS:
+        return False
+    return node.exe_depth <= 2 or os.path.normcase(os.path.normpath(node.path)) in install_dirs
+
+
+def storage_expand(node: StorageNode, install_dirs=frozenset()) -> bool:
+    """Ordner auflösen statt als Ganzes zeigen? Sammelordner und Profile immer. Programme,
+    App-Daten und Programmordner-Kinder nur, wenn sie mehrere Programme bündeln oder ein
+    benanntes Produkt fast allein enthalten („Adobe“ → „Adobe Photoshop 2025“) – nie in
+    technische Unterordner wie „bin“, „x64“ oder „2022“. Sonst nur, wenn der Platz an einer
+    Stelle steckt (ein dominanter Unterordner, eine riesige Datei)."""
+    if not node.is_dir or not node.children or node.project:
+        return False
+    low, parent = node.name.lower(), node.parent_name.lower()
+    if low in STORAGE_SPECIAL_DIRS or low in STORAGE_TEMP_DIRS:
+        return False
+    if low in STORAGE_CONTAINERS or parent in STORAGE_PROFILE_PARENTS:
+        return True
+    if parent in STORAGE_GAME_PARENTS:                  # ein Spiel bleibt ein Spiel
+        return False
+    dirs = [c for c in node.children if c.is_dir]
+    top = max(node.children, key=lambda c: c.size)
+    generic = top.is_dir and bool(_STORAGE_GENERIC.match(top.name))
+    if storage_is_program(node, install_dirs) or parent in STORAGE_UNIT_PARENTS:
+        if node.exe_depth == 0:                          # Programm liegt direkt hier
+            return False
+        progs = [c for c in dirs if storage_is_program(c, install_dirs)]
+        return (len(progs) >= 2 and sum(c.size for c in progs) >= 0.6 * node.size) or \
+            (top.is_dir and not generic and top.size >= 0.8 * node.size
+             and storage_is_program(top, install_dirs))  # Herstellerordner
+    if top.is_dir and not generic and top.size >= 0.6 * node.size:
+        return True
+    if not top.is_dir and top.size >= 0.8 * node.size:  # eine riesige Datei
+        return True
+    big = [c for c in dirs if c.size >= 0.15 * node.size and not _STORAGE_GENERIC.match(c.name)]
+    return len(big) >= 2 and sum(c.size for c in big) >= 0.6 * node.size
+
+
+def storage_top(root: StorageNode, n: int = STORAGE_TOP, install_dirs=frozenset()) -> list:
+    """Die n größten „Einheiten“ (Spiel, Programm, Ordner, Datei) – ohne Doppelzählung."""
+    import heapq
+    heap = [(-c.size, i, c) for i, c in enumerate(root.children)]
+    heapq.heapify(heap)
+    out, i = [], len(heap)
+    while heap and len(out) < n:
+        _neg, _i, node = heapq.heappop(heap)
+        if storage_expand(node, install_dirs):
+            for c in node.children:
+                i += 1
+                heapq.heappush(heap, (-c.size, i, c))
+            continue
+        out.append(node)
+    return out
+
+
+def storage_describe(node: StorageNode, install_dirs=frozenset()) -> tuple[str, str]:
+    """(Art, Anzeigename) – Art steuert Farbe und Aktionen."""
+    low = node.name.lower()
+    if not node.is_dir:
+        if low in STORAGE_SYSTEM_FILES:
+            return "System", STORAGE_SYSTEM_FILES[low]
+        kind = {"video": "Video", "archive": "Archiv", "installer": "Installer"}.get(
+            org_kind(Path(low)), "Datei")
+        return kind, node.name
+    if low in STORAGE_SPECIAL_DIRS:
+        return STORAGE_SPECIAL_DIRS[low]
+    if node.project:
+        return "Projekt", node.name
+    if node.parent_name.lower() in STORAGE_GAME_PARENTS:
+        return "Spiel", node.name
+    if storage_is_program(node, install_dirs) or \
+            node.parent_name.lower() in ("program files", "program files (x86)"):
+        return "Programm", node.name
+    if low in STORAGE_TEMP_DIRS:
+        return "Temporär", node.name
+    if node.parent_name.lower() in ("local", "roaming", "locallow", "programdata", "packages"):
+        return "App-Daten", node.name
+    if low in ORG_USER_DIR_NAMES:
+        return "Benutzerordner", node.name
+    return "Ordner", node.name
+
+
+def storage_drives() -> list[dict]:
+    """Lokale Laufwerke mit Belegung: {root, label, total, used, free, removable}."""
+    out = []
+    if os.name == "nt":
+        import ctypes
+        import string
+        k32 = ctypes.windll.kernel32
+        mask = k32.GetLogicalDrives()
+        for i, letter in enumerate(string.ascii_uppercase):
+            if not mask >> i & 1:
+                continue
+            root = f"{letter}:\\"
+            kind = k32.GetDriveTypeW(root)
+            if kind not in (2, 3, 6):                   # Wechsel-, Fest-, RAM-Laufwerk
+                continue
+            name = ctypes.create_unicode_buffer(261)
+            k32.GetVolumeInformationW(root, name, 261, None, None, None, None, 0)
+            try:
+                du = shutil.disk_usage(root)
+            except OSError:                              # leerer Kartenleser o. ä.
+                continue
+            out.append({"root": Path(root), "label": name.value or ("Wechseldatenträger"
+                        if kind == 2 else "Lokaler Datenträger"), "total": du.total,
+                        "used": du.used, "free": du.free, "removable": kind == 2})
+        return out
+    seen = set()
+    for root in (Path.home(), Path("/")):
+        try:
+            dev, du = root.stat().st_dev, shutil.disk_usage(root)
+        except OSError:
+            continue
+        if dev in seen:
+            continue
+        seen.add(dev)
+        out.append({"root": root, "label": "Persönlicher Ordner" if root != Path("/") else "System",
+                    "total": du.total, "used": du.used, "free": du.free, "removable": False})
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -9203,7 +9496,7 @@ def _isolate_qt() -> None:
 
 _isolate_qt()
 
-from PySide6.QtCore import (QFile, QFileInfo, QFileSystemWatcher, QMimeData, QObject, QPoint,
+from PySide6.QtCore import (QEvent, QFile, QFileInfo, QFileSystemWatcher, QMimeData, QObject, QPoint,
                             QPointF, QPropertyAnimation, QRect, QRectF, QSize, Qt, QThread,
                             QTimer, QUrl, QVariantAnimation, Signal)
 from PySide6.QtGui import (QBrush, QColor, QCursor, QDesktopServices, QDrag, QFont, QIcon,
@@ -9214,7 +9507,8 @@ from PySide6.QtWidgets import (QAbstractButton, QAbstractItemView, QApplication,
                                QFileIconProvider, QFrame, QGraphicsDropShadowEffect,
                                QHBoxLayout, QInputDialog, QLabel, QLineEdit,
                                QListView, QListWidget, QListWidgetItem, QMenu,
-                               QMessageBox, QScrollArea, QSizeGrip, QSystemTrayIcon,
+                               QMessageBox, QScrollArea, QSizeGrip, QStackedWidget,
+                               QSystemTrayIcon, QToolTip,
                                QVBoxLayout, QWidget)
 
 
@@ -9774,9 +10068,11 @@ class ResearchJob(QObject):
     progress = Signal(int, int, str)
     finished = Signal(dict, dict)
 
-    def __init__(self, items: list[Item], sources: list[str], parent=None, force=False):
+    def __init__(self, items: list[Item], sources: list[str], parent=None, force=False,
+                 query_fn=None, check_binaries=True):
         super().__init__(parent)
         self.items, self.sources, self.force = items, sources, force
+        self.query_fn, self.check_binaries = query_fn, check_binaries
         self.cancel = False
         self._thread = None
 
@@ -9792,7 +10088,8 @@ class ResearchJob(QObject):
         try:
             res, status = research_run(self.items, cache, sources=self.sources,
                                        progress=self.progress.emit, stop=lambda: self.cancel,
-                                       force=self.force)
+                                       force=self.force, query_fn=self.query_fn,
+                                       check_binaries=self.check_binaries)
         except Exception as e:               # noqa: BLE001 — in der GUI anzeigen
             res, status = {}, {"_error": f"{type(e).__name__}: {e}"}
         research_cache_save(cache)
@@ -9807,6 +10104,7 @@ class MainWindow(_Base):
         super().__init__()
         self.args = args
         self.fences = fences
+        self.mgr = fences or LocalCfg()  # Einstellungen für Seiten (ohne Boxen: nur Sitzung)
         self.keep_running = False       # True → Schließen versteckt nur (Infobereich)
         self.memory = Memory(args.memory)
         self.toml_rules = load_rules(args.rules)
@@ -9819,7 +10117,6 @@ class MainWindow(_Base):
         self.user_dir: Path | None = None
         self._worker: Worker | None = None
         self._research: ResearchJob | None = None
-        self._research_cfg: dict = {}   # ohne Boxen-Verwaltung: Einstellungen nur für die Sitzung
         self.research_results: dict[str, dict] = {}  # Pfad → Ergebnis, übersteht Neu-Scans
         self._apply_pending = False     # „In Boxen sortieren“ wartet auf die Recherche
         self._research_next = None      # nach Abbruch als Nächstes starten
@@ -9842,25 +10139,40 @@ class MainWindow(_Base):
         QTimer.singleShot(0, self.rescan)
 
     # ---------- Aufbau ----------
-    def _build(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(22, 40 if FRAMELESS else 22, 22, 22)
-        root.setSpacing(16)
+    PAGES = [("desktop", "🖥  Desktop"), ("folders", "📁  Ordner"), ("clean", "🧹  Aufräumen"),
+             ("storage", "💾  Speicher")]
 
+    def _build(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(22, 40 if FRAMELESS else 22, 22, 22)
+        outer.setSpacing(14)
+        top = QHBoxLayout()
+        title = QLabel("Desktop Sorter")
+        title.setObjectName("h1")
+        top.addWidget(title)
+        top.addStretch(1)
+        self.switch = Segmented([label for _k, label in self.PAGES])
+        self.switch.changed.connect(lambda i: self.show_page(self.PAGES[i][0]))
+        top.addWidget(self.switch)
+        outer.addLayout(top)
+        self.pages = QStackedWidget()
+        outer.addWidget(self.pages, 1)
+
+        # ----- Seite „Desktop“ -----
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(14)
         head = QHBoxLayout()
         titles = QVBoxLayout()
         titles.setSpacing(2)
-        title = QLabel("Desktop Sorter")
-        title.setObjectName("h1")
-        self.subtitle = QLabel("…")
+        self.subtitle = ElideLabel("…")
         self.subtitle.setObjectName("sub")
         self.research_label = ElideLabel("")
         self.research_label.setObjectName("sub")
-        titles.addWidget(title)
         titles.addWidget(self.subtitle)
         titles.addWidget(self.research_label)
-        head.addLayout(titles)
-        head.addStretch(1)
+        head.addLayout(titles, 1)
 
         self.t_public = Toggle("Öffentlicher Desktop", checked=True)
         self.t_folders = Toggle("Ordner einbeziehen", checked=True)
@@ -9910,10 +10222,10 @@ class MainWindow(_Base):
         self.b_undo = tool("↶  Rückgängig", self.undo, "Letzte Sortierung vollständig umkehren")
         divider()
         self.b_org = tool("📁  Ordner-Assistent ▾", self.show_organizer_menu,
-                          "Beliebigen Ordner analysieren, sortieren und sicher aufräumen", True)
-        self.b_clean = tool("🧹  Downloads", lambda: self.fences.open_cleaner(downloads_dir()),
+                          "Beliebigen Ordner analysieren, sortieren und sicher aufräumen")
+        self.b_clean = tool("🧹  Downloads", lambda: self.show_page("clean", downloads_dir()),
                             "Downloads im Tinder-Stil durchwischen: links = Papierkorb, "
-                            "rechts = behalten", True)
+                            "rechts = behalten")
         self.b_trash = tool("🗑  Papierkorb", self.trash_selected,
                             "Markierte Objekte in den Papierkorb verschieben (Taste Entf)")
         divider()
@@ -9993,6 +10305,16 @@ class MainWindow(_Base):
         rl.addWidget(self.desk_list, 1)
         body.addWidget(self.desk)
         root.addLayout(body, 1)
+        self.pages.addWidget(page)
+
+        # ----- Seiten „Ordner“, „Aufräumen“, „Speicher“ (keine eigenen Fenster) -----
+        self.organizer = OrganizerView(self.mgr, downloads_dir(), autostart=False,
+                                       boxes_fn=self.box_dirs)
+        self.organizer.on_swipe = self.start_swipe
+        self.cleaner = CleanerView(self.mgr, downloads_dir(), autoload=False)
+        self.storage = StorageView(self.mgr, on_open_folder=lambda p: self.show_page("folders", p))
+        for w in (self.organizer, self.cleaner, self.storage):
+            self.pages.addWidget(w)
 
         self.busy_widgets = [self.b_scan, self.b_research, self.b_undo, self.b_apply,
                              self.b_trash, self.b_accept, self.t_public, self.t_folders,
@@ -10002,6 +10324,53 @@ class MainWindow(_Base):
     def paintEvent(self, _):
         p = QPainter(self)
         paint_backdrop(p, self.rect(), overlay_only=ACRYLIC)
+
+    # ---------- Seiten ----------
+    def current_page(self) -> str:
+        return self.PAGES[self.pages.currentIndex()][0]
+
+    def show_page(self, key: str, folder=None):
+        """Seite wechseln (optional mit Ordner). Offene Wisch-Entscheidungen werden beim
+        Verlassen von „Aufräumen“ ausgeführt."""
+        keys = [k for k, _l in self.PAGES]
+        if key not in keys:
+            return
+        if self.current_page() == "clean" and key != "clean":
+            self._leave_cleaner()
+        self.pages.setCurrentIndex(keys.index(key))
+        self.switch.set_index(keys.index(key))
+        if key == "folders":
+            if folder:
+                self.organizer.set_folder(Path(folder))
+            elif self.organizer.plan is None and not (self.organizer._worker and
+                                                      self.organizer._worker.isRunning()):
+                self.organizer.analyze()
+        elif key == "clean":
+            if folder:
+                self.cleaner.set_source(Path(folder))
+            elif not self.cleaner.loaded or self.cleaner.committed:
+                self.cleaner.set_source(self.cleaner.folder if self.cleaner.fixed is None
+                                        else downloads_dir())
+            self.cleaner.setFocus()
+        elif key == "storage":
+            self.storage.activate()
+
+    def _leave_cleaner(self):
+        self.cleaner.commit_and_report()
+        if self.cleaner.on_finish:                   # kam vom Ordner-Assistenten
+            self.cleaner.on_finish = None
+            self.organizer.analyze()
+
+    def start_swipe(self, paths: list, title: str, plan):
+        """„Einzeln durchwischen“ aus dem Ordner-Assistenten – auf der Seite „Aufräumen“."""
+        def back():
+            self.show_page("folders")
+            self.organizer.analyze()
+        self.cleaner.set_source(self.organizer.folder, entries=paths, title=title, hints=plan,
+                                on_finish=back)
+        self.pages.setCurrentWidget(self.cleaner)
+        self.switch.set_index([k for k, _l in self.PAGES].index("clean"))
+        self.cleaner.setFocus()
 
     # ---------- Daten ----------
     def icon_for(self, it: Item) -> QIcon:
@@ -10312,9 +10681,9 @@ class MainWindow(_Base):
         if one:
             m.addAction("▶  Öffnen", lambda: self.open_item(one.path))
             m.addAction("↗  Dateispeicherort öffnen", lambda: reveal_path(str(one.path)))
-            if one.kind == "folder" and self.fences:
+            if one.kind == "folder":
                 m.addAction("📁  Mit Ordner-Assistent aufräumen …",
-                            lambda: self.fences.open_organizer(one.path))
+                            lambda: self.show_page("folders", one.path))
             if one.category != "Sonstiges":
                 m.addAction(f"★  Als Regel für „{one.category}“ merken …",
                             lambda: self.remember_rule(one))
@@ -10415,7 +10784,20 @@ class MainWindow(_Base):
         menu.exec(button.mapToGlobal(QPoint(0, button.height() + 4)))
 
     def show_organizer_menu(self):
-        self._menu_below(self.fences.organizer_menu(self), self.b_org)
+        m = glass_menu(self)
+        for glyph, label, key in ORG_QUICK_FOLDERS:
+            m.addAction(f"{glyph}  {label}",
+                        lambda k=key: self.show_page("folders", org_known_folder(k)))
+        m.addSeparator()
+        m.addAction("Anderer Ordner …", self._pick_folder)
+        self._menu_below(m, self.b_org)
+
+    def _pick_folder(self):
+        from PySide6.QtWidgets import QFileDialog
+        d = QFileDialog.getExistingDirectory(self, "Ordner aufräumen & sortieren",
+                                             str(org_known_folder("documents")))
+        if d:
+            self.show_page("folders", Path(d))
 
     def show_more_menu(self):
         f = self.fences
@@ -10432,15 +10814,12 @@ class MainWindow(_Base):
 
     # ---------- Recherche in offenen Quellen ----------
     def research_settings(self) -> tuple[bool, list[str]]:
-        return research_settings(self.fences.cfg if self.fences else {"research": self._research_cfg})
+        return research_settings(self.mgr.cfg)
 
     def _set_research(self, on: bool, sources: list[str]):
-        cfg = {"on": on, "sources": [s for s in RESEARCH_SOURCES if s in sources]}
-        if self.fences:
-            self.fences.cfg["research"] = cfg
-            self.fences.write_cfg()
-        else:
-            self._research_cfg = cfg
+        self.mgr.cfg["research"] = {"on": on,
+                                    "sources": [s for s in RESEARCH_SOURCES if s in sources]}
+        self.mgr.write_cfg()
 
     def research_running(self) -> bool:
         """Läuft – oder das Ergebnis ist noch nicht zugestellt."""
@@ -10701,12 +11080,14 @@ class MainWindow(_Base):
         self.rescan()
 
     def closeEvent(self, e):
+        self.cleaner.commit_and_report()  # Markiertes aus „Aufräumen“ jetzt ausführen
         if self.keep_running:           # App läuft mit den Boxen im Infobereich weiter
             e.ignore()
             self.hide()
         else:
-            if self._research:
-                self._research.cancel = True
+            for job in (self._research, self.storage._job, self.organizer._research):
+                if job:
+                    job.cancel = True
             super().closeEvent(e)
 
     # ---------- Dialoge ----------
@@ -11620,6 +12001,7 @@ class FenceManager(QObject):
     visibilityChanged = Signal(bool)
     notify = Signal(str, str)
     renamed = Signal(str, str)          # Box umbenannt (alt, neu)
+    pageRequested = Signal(str, object)  # Seite im Hauptfenster öffnen (Seite, Ordner)
 
     def __init__(self, storage: Path, rules_path: Path | None = None,
                  memory_path: Path | None = None):
@@ -12168,28 +12550,12 @@ class FenceManager(QObject):
         return prefs
 
     def open_cleaner(self, folder: Path):
-        win = getattr(self, "_cleaner", None)
-        if win is None or not win.isVisible():
-            win = self._cleaner = CleanerWindow(self, folder)
-        win.show()
-        win.raise_()
-        win.activateWindow()
+        """Aufräumen (Tinder-Stil) als Seite im Hauptfenster – kein eigenes Fenster."""
+        self.pageRequested.emit("clean", Path(folder))
 
     def open_organizer(self, folder: Path):
-        """Ordner-Assistent für einen Ordner (ein Fenster je Ordner)."""
-        folder = Path(folder)
-        wins = [w for w in getattr(self, "_organizers", []) if w.isVisible()]
-        for w in wins:
-            if os.path.normcase(str(w.folder)) == os.path.normcase(str(folder)):
-                break
-        else:
-            w = OrganizerWindow(self, folder)
-            wins.append(w)
-        self._organizers = wins
-        w.show()
-        w.showNormal()
-        w.raise_()
-        w.activateWindow()
+        """Ordner-Assistent als Seite im Hauptfenster – kein eigenes Fenster."""
+        self.pageRequested.emit("folders", Path(folder))
 
     def pick_and_organize(self):
         from PySide6.QtWidgets import QFileDialog
@@ -12293,8 +12659,8 @@ def download_origin(path: Path) -> str:
 
 
 def human_size(n: float) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}".replace(".", ",")
         n /= 1024
     return ""
@@ -12529,7 +12895,10 @@ class SwipeCard(QWidget):
                  "geladen am " + time.strftime("%d.%m.%Y, %H:%M", time.localtime(e["mtime"]))]
         if e.get("origin"):
             lines.append(f"von {e['origin']}")
-        p.drawText(QRectF(r.left() + 22, y + 52, r.width() - 44, 80),
+        if e.get("research"):
+            lines.append(p.fontMetrics().elidedText(e["research"], Qt.ElideRight,
+                                                    int(r.width() - 44)))
+        p.drawText(QRectF(r.left() + 22, y + 52, r.width() - 44, 84),
                    Qt.AlignLeft | Qt.AlignTop, "\n".join(lines))
 
         chip = org_chip(e.get("org"))           # Vorsortierung: Vorschlag + Grund
@@ -12610,56 +12979,652 @@ class RoundButton(QAbstractButton):
         p.drawText(self.rect(), Qt.AlignCenter, self.glyph)
 
 
+# --------------------------------------------------------------------------- #
+# Seite „Speicher“ – Top 20 Platzfresser je Laufwerk
+# --------------------------------------------------------------------------- #
+class LocalCfg(QObject):
+    """Einstellungen ohne Boxen-Verwaltung (Testansicht): gelten nur für die Sitzung."""
+    notify = Signal(str, str)
+
+    def __init__(self):
+        super().__init__()
+        self.cfg = {"settings": dict(SETTINGS_DEFAULTS), "boxes": {}, "snapshots": {}}
+
+    def write_cfg(self):
+        pass
+
+    def launch(self, path: str):
+        try:
+            open_path(path)
+        except OSError as e:
+            QMessageBox.warning(None, "Desktop Sorter", f"Konnte nicht öffnen:\n{path}\n\n{e}")
+
+
+class Segmented(QWidget):
+    """iOS-Segmentschalter im Glas-Look."""
+    changed = Signal(int)
+
+    def __init__(self, labels: list[str], parent=None):
+        super().__init__(parent)
+        self.labels, self.index, self._hover = labels, 0, -1
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(38)
+        f = self.font()
+        f.setWeight(QFont.DemiBold)
+        self.setFont(f)
+
+    def _widths(self) -> list[int]:
+        fm = self.fontMetrics()
+        return [fm.horizontalAdvance(t) + 34 for t in self.labels]
+
+    def sizeHint(self):
+        return QSize(sum(self._widths()) + 8, 38)
+
+    minimumSizeHint = sizeHint
+
+    def _rects(self) -> list[QRectF]:
+        ws, x, out = self._widths(), 4.0, []
+        scale = (self.width() - 8) / max(1, sum(ws))
+        for w in ws:
+            out.append(QRectF(x, 4, w * scale, self.height() - 8))
+            x += w * scale
+        return out
+
+    def _at(self, pos) -> int:
+        return next((i for i, r in enumerate(self._rects()) if r.contains(QPointF(pos))), -1)
+
+    def set_index(self, i: int, emit=False):
+        if 0 <= i < len(self.labels) and (i != self.index or emit):
+            self.index = i
+            self.update()
+            if emit:
+                self.changed.emit(i)
+
+    def mouseMoveEvent(self, e):
+        self._hover = self._at(e.position().toPoint())
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = -1
+        self.update()
+
+    def mousePressEvent(self, e):
+        i = self._at(e.position().toPoint())
+        if i >= 0:
+            self.set_index(i, emit=True)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        paint_glass(p, self.rect(), self.height() / 2, strength=0.9)
+        for i, (r, text) in enumerate(zip(self._rects(), self.labels)):
+            if i == self.index:
+                paint_glass(p, r, r.height() / 2, strength=3.0, tint=ACCENT)
+            elif i == self._hover:
+                path = QPainterPath()
+                path.addRoundedRect(r, r.height() / 2, r.height() / 2)
+                p.fillPath(path, QColor(255, 255, 255, 26))
+            p.setPen(Qt.white if i == self.index else QColor(255, 255, 255, 200))
+            p.drawText(r, Qt.AlignCenter, text)
+
+
+class DriveCard(QAbstractButton):
+    """Laufwerk mit Belegungsbalken."""
+
+    def __init__(self, drive: dict, parent=None):
+        super().__init__(parent)
+        self.drive = drive
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(236, 84)
+        self._hover = False
+        d = drive
+        self.setToolTip(f"{d['root']}  ·  {d['label']}\n{human_size(d['used'])} belegt · "
+                        f"{human_size(d['free'])} frei · {human_size(d['total'])} gesamt")
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        paint_glass(p, r, 16, strength=1.2, tint=ACCENT if self.isChecked() else None,
+                    hover=self._hover, active=self.isChecked())
+        d = self.drive
+        f = self.font()
+        f.setPixelSize(14)
+        f.setWeight(QFont.Bold)
+        p.setFont(f)
+        p.setPen(Qt.white)
+        root = str(d["root"]).rstrip("\\/") or str(d["root"])
+        title = p.fontMetrics().elidedText(f"{'🔌' if d.get('removable') else '💽'}  {root}",
+                                           Qt.ElideMiddle, int(r.width() * 0.5))
+        p.drawText(QRectF(14, 8, r.width() - 28, 22), Qt.AlignLeft | Qt.AlignVCenter, title)
+        used_w = p.fontMetrics().horizontalAdvance(title) + 24
+        f.setPixelSize(11)
+        f.setWeight(QFont.Normal)
+        p.setFont(f)
+        p.setPen(TEXT_2)
+        p.drawText(QRectF(14, 8, r.width() - 26, 22), Qt.AlignRight | Qt.AlignVCenter,
+                   p.fontMetrics().elidedText(d["label"], Qt.ElideRight,
+                                              int(max(0, r.width() - 26 - used_w))))
+        share = d["used"] / max(1, d["total"])
+        bar = QRectF(14, 38, r.width() - 26, 10)
+        path = QPainterPath()
+        path.addRoundedRect(bar, 5, 5)
+        p.fillPath(path, QColor(255, 255, 255, 40))
+        fill = QPainterPath()
+        fill.addRoundedRect(QRectF(bar.left(), bar.top(), bar.width() * share, bar.height()), 5, 5)
+        p.fillPath(fill, QColor("#FF453A" if share > 0.9 else "#FF9F0A" if share > 0.75
+                                else "#0A84FF"))
+        p.setPen(QColor(255, 255, 255, 215))
+        p.drawText(QRectF(14, 54, r.width() - 26, 20), Qt.AlignLeft | Qt.AlignVCenter,
+                   f"{human_size(d['free'])} frei von {human_size(d['total'])}")
+        p.drawText(QRectF(14, 54, r.width() - 26, 20), Qt.AlignRight | Qt.AlignVCenter,
+                   f"{round(share * 100)} %")
+
+
+class HogList(QWidget):
+    """Horizontales Balkendiagramm der Platzfresser (absteigend, Farbe = Art)."""
+    menuRequested = Signal(int, QPoint)
+    activated = Signal(int)
+    ROW = 48
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.rows: list[dict] = []
+        self.used = 1
+        self._hover = -1
+        self.setMouseTracking(True)
+
+    def set_rows(self, rows: list[dict], used: int):
+        self.rows, self.used, self._hover = rows, max(1, used), -1
+        self.setMinimumHeight(len(rows) * self.ROW + 8)
+        self.updateGeometry()
+        self.update()
+
+    def sizeHint(self):
+        return QSize(600, len(self.rows) * self.ROW + 8)
+
+    def _row_at(self, y: float) -> int:
+        i = int(y // self.ROW)
+        return i if 0 <= i < len(self.rows) else -1
+
+    def event(self, e):
+        if e.type() == QEvent.ToolTip:
+            i = self._row_at(e.position().y() if hasattr(e, "position") else e.pos().y())
+            if i >= 0:
+                r = self.rows[i]
+                tip = f"{r['label']}  ·  {human_size(r['size'])}\n{r['path']}"
+                if r.get("research"):
+                    tip += "\n\nRecherche:\n" + "\n".join(f"• {x}" for x in r["research"][:4])
+                QToolTip.showText(e.globalPos(), tip, self)
+            else:
+                QToolTip.hideText()
+            return True
+        return super().event(e)
+
+    def mouseMoveEvent(self, e):
+        i = self._row_at(e.position().y())
+        if i != self._hover:
+            self._hover = i
+            self.update()
+
+    def leaveEvent(self, e):
+        self._hover = -1
+        self.update()
+
+    def contextMenuEvent(self, e):
+        i = self._row_at(e.pos().y())
+        if i >= 0:
+            self.menuRequested.emit(i, e.globalPos())
+
+    def mouseDoubleClickEvent(self, e):
+        i = self._row_at(e.position().y())
+        if i >= 0:
+            self.activated.emit(i)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        if not self.rows:
+            return
+        w = self.width()
+        biggest = max(r["size"] for r in self.rows) or 1
+        name_w, size_w = int(w * 0.38), 150
+        bar_x, bar_w = 44 + name_w + 12, max(40, w - (44 + name_w + 12) - size_w - 8)
+        f = self.font()
+        for i, r in enumerate(self.rows):
+            y = i * self.ROW
+            row = QRectF(0, y + 2, w, self.ROW - 4)
+            if i == self._hover:
+                path = QPainterPath()
+                path.addRoundedRect(row, 10, 10)
+                p.fillPath(path, QColor(255, 255, 255, 22))
+            color = QColor(STORAGE_KIND_COLORS.get(r["kind"], "#64D2FF"))
+            f.setPixelSize(13)
+            f.setWeight(QFont.DemiBold)
+            p.setFont(f)
+            p.setPen(TEXT_2)
+            p.drawText(QRectF(4, y, 32, self.ROW), Qt.AlignRight | Qt.AlignVCenter, f"{i + 1}")
+            # Name + Art/Pfad
+            p.setPen(Qt.white)
+            fm = p.fontMetrics()
+            p.drawText(QRectF(44, y + 5, name_w, 20), Qt.AlignLeft | Qt.AlignVCenter,
+                       fm.elidedText(r["label"], Qt.ElideRight, name_w))
+            f.setPixelSize(11)
+            f.setWeight(QFont.Normal)
+            p.setFont(f)
+            fm = p.fontMetrics()
+            pill = r["kind"]
+            pw = fm.horizontalAdvance(pill) + 14
+            pr = QRectF(44, y + 27, pw, 16)
+            bg = QColor(color)
+            bg.setAlpha(70)
+            path = QPainterPath()
+            path.addRoundedRect(pr, 8, 8)
+            p.fillPath(path, bg)
+            p.setPen(color.lighter(140))
+            p.drawText(pr, Qt.AlignCenter, pill)
+            p.setPen(TEXT_2)
+            sub = r.get("note") or r["path"]
+            p.drawText(QRectF(44 + pw + 8, y + 27, name_w - pw - 8, 16), Qt.AlignLeft | Qt.AlignVCenter,
+                       fm.elidedText(sub, Qt.ElideMiddle, int(name_w - pw - 8)))
+            # Balken
+            bar = QRectF(bar_x, y + 15, bar_w * r["size"] / biggest, 18)
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(bar_x, y + 15, bar_w, 18), 6, 6)
+            p.fillPath(path, QColor(255, 255, 255, 18))
+            path = QPainterPath()
+            path.addRoundedRect(bar, 6, 6)
+            p.fillPath(path, color)
+            # Größe + Anteil
+            f.setPixelSize(13)
+            f.setWeight(QFont.Bold)
+            p.setFont(f)
+            p.setPen(Qt.white)
+            p.drawText(QRectF(w - size_w, y + 5, size_w - 8, 20), Qt.AlignRight | Qt.AlignVCenter,
+                       human_size(r["size"]))
+            f.setPixelSize(11)
+            f.setWeight(QFont.Normal)
+            p.setFont(f)
+            p.setPen(TEXT_2)
+            p.drawText(QRectF(w - size_w, y + 26, size_w - 8, 16), Qt.AlignRight | Qt.AlignVCenter,
+                       f"{r['size'] / self.used * 100:.1f} % der Belegung".replace(".", ","))
+
+
+class StorageJob(QObject):
+    """Laufwerk scannen, Platzfresser bestimmen, Programme/Spiele nachschlagen – im
+    Hintergrund (Daemon-Thread, abbrechbar)."""
+    progress = Signal(int, str)
+    finished = Signal(object)
+
+    def __init__(self, drive: dict, sources: list[str], parent=None):
+        super().__init__(parent)
+        self.drive, self.sources = drive, sources
+        self.cancel = False
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def is_running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    def _run(self):
+        t0 = time.time()
+        try:
+            node = storage_scan(self.drive["root"], progress=self.progress.emit,
+                                stop=lambda: self.cancel)
+            install = installed_locations()
+            rows = []
+            for n in storage_top(node, STORAGE_TOP, install):
+                kind, label = storage_describe(n, install)
+                rows.append({"label": label, "path": n.path, "size": n.size, "kind": kind,
+                             "is_dir": n.is_dir, "note": "", "research": [],
+                             "exe_depth": n.exe_depth})
+            looked = [r for r in rows if r["kind"] in ("Programm", "Spiel", "Ordner")]
+            if self.sources and looked and not self.cancel:
+                self.progress.emit(node.files, "Recherche zu Programmen und Spielen …")
+                items = [Item(Path(r["path"]), "user", "folder") for r in looked]
+                cache = research_cache_load()
+                res, _st = research_run(items, cache, sources=self.sources,
+                                        stop=lambda: self.cancel, check_binaries=False,
+                                        query_fn=lambda it: online_clean_name(it.path.name))
+                research_cache_save(cache)
+                for r in looked:
+                    found = res.get(str(Path(r["path"])))
+                    if not found or not found.get("evidence"):
+                        continue
+                    r["research"] = research_lines(found)
+                    first = found["evidence"][0]
+                    r["note"] = f"{first['text']} ({first['source']})"
+                    if found.get("category") in GAMING and r["kind"] in ("Programm", "Ordner"):
+                        r["kind"] = "Spiel"
+                    elif found.get("category") and r["kind"] == "Ordner" and r["exe_depth"] <= 3:
+                        r["kind"] = "Programm"
+            result = {"drive": self.drive, "rows": rows, "scanned": node.size,
+                      "files": node.files, "denied": node.denied, "cloud": node.cloud,
+                      "seconds": time.time() - t0, "cancelled": self.cancel}
+        except Exception as e:                           # noqa: BLE001 — im UI anzeigen
+            result = {"drive": self.drive, "error": f"{type(e).__name__}: {e}"}
+        self.finished.emit(result)
+
+
+class StorageView(QWidget):
+    """Welche Programme, Spiele und Dateien belegen am meisten Platz – je Laufwerk."""
+
+    def __init__(self, mgr, drives_fn=None, on_open_folder=None, parent=None):
+        super().__init__(parent)
+        self.mgr = mgr
+        self.drives_fn = drives_fn or storage_drives
+        self.on_open_folder = on_open_folder
+        self.drives: list[dict] = []
+        self.cards: list[DriveCard] = []
+        self.results: dict[str, dict] = {}
+        self.current = -1
+        self._job: StorageJob | None = None
+        self._build()
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(12)
+        head = QHBoxLayout()
+        titles = QVBoxLayout()
+        titles.setSpacing(2)
+        t = QLabel("💾  Speicherplatz")
+        t.setObjectName("h2")
+        self.sub = QLabel("Welche Programme, Spiele und Dateien belegen am meisten Platz?")
+        self.sub.setObjectName("sub")
+        titles.addWidget(t)
+        titles.addWidget(self.sub)
+        head.addLayout(titles)
+        head.addStretch(1)
+        self.b_drives = GlassButton("Laufwerke aktualisieren", small=True)
+        self.b_drives.clicked.connect(self.load_drives)
+        self.b_scan = GlassButton("↻  Neu analysieren", primary=True)
+        self.b_scan.clicked.connect(lambda: self.scan(self.current, force=True))
+        head.addWidget(self.b_drives)
+        head.addWidget(self.b_scan)
+        root.addLayout(head)
+
+        self.drive_row = QHBoxLayout()
+        self.drive_row.setSpacing(12)
+        holder = QWidget()
+        holder.setLayout(self.drive_row)
+        holder.setAutoFillBackground(False)
+        scroll = QScrollArea()
+        scroll.setWidget(holder)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setFixedHeight(90)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.viewport().setAutoFillBackground(False)
+        root.addWidget(scroll)
+
+        self.progress_row = QWidget()
+        pr = QHBoxLayout(self.progress_row)
+        pr.setContentsMargins(0, 0, 0, 0)
+        self.progress_lbl = ElideLabel("")
+        self.progress_lbl.setObjectName("sub")
+        self.progress_bar = OrgProgressBar()
+        self.b_cancel = GlassButton("Abbrechen", small=True)
+        self.b_cancel.clicked.connect(self.cancel)
+        pr.addWidget(self.progress_lbl, 2)
+        pr.addWidget(self.progress_bar, 1)
+        pr.addWidget(self.b_cancel)
+        self.progress_row.hide()
+        root.addWidget(self.progress_row)
+
+        self.panel = GlassPanel()
+        pl = QVBoxLayout(self.panel)
+        pl.setContentsMargins(16, 14, 16, 12)
+        self.res_title = ElideLabel("Laufwerk wählen")
+        self.res_title.setObjectName("h2")
+        self.res_sub = ElideLabel("")
+        self.res_sub.setObjectName("sub")
+        self.legend = QLabel("")
+        self.legend.setObjectName("sub")
+        self.legend.setTextFormat(Qt.RichText)
+        pl.addWidget(self.res_title)
+        pl.addWidget(self.res_sub)
+        pl.addWidget(self.legend)
+        self.hogs = HogList()
+        self.hogs.menuRequested.connect(self.row_menu)
+        self.hogs.activated.connect(lambda i: reveal_path(self.hogs.rows[i]["path"]))
+        sc = QScrollArea()
+        sc.setWidget(self.hogs)
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QFrame.NoFrame)
+        sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        sc.viewport().setAutoFillBackground(False)
+        pl.addWidget(sc, 1)
+        root.addWidget(self.panel, 1)
+
+    def paintEvent(self, _):
+        if self.isWindow():
+            p = QPainter(self)
+            paint_backdrop(p, self.rect(), overlay_only=False)
+
+    # ----- Laufwerke -----
+    def activate(self):
+        """Beim ersten Öffnen: Laufwerke lesen und das Systemlaufwerk analysieren."""
+        if not self.drives:
+            self.load_drives()
+
+    def load_drives(self):
+        try:
+            self.drives = list(self.drives_fn())
+        except Exception as e:                           # noqa: BLE001
+            self.drives = []
+            self.sub.setText(f"Laufwerke nicht lesbar: {e}")
+        for c in self.cards:
+            c.deleteLater()
+        self.cards = []
+        while self.drive_row.count():
+            self.drive_row.takeAt(0)
+        for i, d in enumerate(self.drives):
+            card = DriveCard(d)
+            card.clicked.connect(lambda _=False, i=i: self.select(i))
+            self.cards.append(card)
+            self.drive_row.addWidget(card)
+        self.drive_row.addStretch(1)
+        if self.drives:
+            home = str(Path.home()).lower()
+            first = next((i for i, d in enumerate(self.drives)
+                          if home.startswith(str(d["root"]).lower())), 0)
+            self.select(first)
+
+    def select(self, i: int):
+        self.current = i
+        for j, c in enumerate(self.cards):
+            c.setChecked(j == i)
+        d = self.drives[i]
+        res = self.results.get(str(d["root"]))
+        if res:
+            self.show_result(res)
+        else:
+            self.scan(i)
+
+    def scan(self, i: int, force=False):
+        if not (0 <= i < len(self.drives)):
+            return
+        if self._job and self._job.is_running():
+            if self._job.drive is self.drives[i]:
+                return
+            self._job.cancel = True
+        d = self.drives[i]
+        on, srcs = research_settings(self.mgr.cfg)
+        self._job = job = StorageJob(d, srcs if on else [], self)
+        job.progress.connect(lambda n, path, j=job: j is self._job and self._progress(n, path))
+        job.finished.connect(lambda res, j=job: self._done(j, res))
+        self.res_title.setText(f"Analysiere {str(d['root']).rstrip(chr(92) + '/')} …")
+        self.res_sub.setText("Das dauert beim ersten Mal je nach Laufwerk ein bis wenige Minuten.")
+        self.legend.setText("")
+        self.hogs.set_rows([], 1)
+        self.progress_row.show()
+        self.progress_bar.set_value(0, 0)
+        self.progress_lbl.setText("Lese Ordner …")
+        job.start()
+
+    def cancel(self):
+        if self._job:
+            self._job.cancel = True
+
+    def _progress(self, files: int, path: str):
+        self.progress_lbl.setText(f"{files:,} Dateien  ·  {path}".replace(",", "."))
+
+    def _done(self, job, res: dict):
+        if job is not self._job:
+            return
+        self._job = None
+        self.progress_row.hide()
+        if res.get("error"):
+            self.res_title.setText("Analyse fehlgeschlagen")
+            self.res_sub.setText(res["error"])
+            return
+        if not res.get("cancelled"):
+            self.results[str(res["drive"]["root"])] = res
+        self.show_result(res)
+
+    def show_result(self, res: dict):
+        d = res["drive"]
+        name = str(d["root"]).rstrip("\\/") or str(d["root"])
+        self.res_title.setText(f"Die {len(res['rows'])} größten Platzfresser auf {name}"
+                               + ("  (abgebrochen – unvollständig)" if res.get("cancelled") else ""))
+        files = f"{res['files']:,}".replace(",", ".")
+        parts = [f"belegt {human_size(d['used'])} von {human_size(d['total'])}",
+                 f"erfasst {human_size(res['scanned'])} in {files} Dateien",
+                 f"{res['seconds']:.0f} s"]
+        rest = d["used"] - res["scanned"]
+        if rest > 1024 ** 3:
+            parts.append(f"{human_size(rest)} nicht erfasst (Systembereiche, fehlende Rechte)")
+        if res.get("cloud"):
+            parts.append(f"OneDrive „nur online“: {human_size(res['cloud'])} (belegt nichts)")
+        self.res_sub.setText("  ·  ".join(parts))
+        self._set_rows(res["rows"], d["used"])
+
+    def _set_rows(self, rows: list[dict], used: int):
+        kinds = list(dict.fromkeys(r["kind"] for r in rows))
+        self.legend.setText("  ".join(
+            f"<span style='color:{STORAGE_KIND_COLORS.get(k, '#64D2FF')}'>●</span> {k}"
+            for k in kinds) + "   ·   Rechtsklick: Explorer, Ordner-Assistent, Deinstallieren, "
+                              "Papierkorb")
+        self.hogs.set_rows(rows, used)
+
+    # ----- Aktionen -----
+    def row_menu(self, i: int, pos):
+        r = self.hogs.rows[i]
+        path, kind = r["path"], r["kind"]
+        m = glass_menu(self)
+        m.addAction("↗  Im Explorer zeigen", lambda: reveal_path(path))
+        if r["is_dir"] and kind not in ("System", "Papierkorb") and self.on_open_folder:
+            m.addAction("📁  Im Ordner-Assistenten öffnen",
+                        lambda: self.on_open_folder(Path(path)))
+        m.addSeparator()
+        if kind in ("Programm", "Spiel"):
+            act = m.addAction("🧩  Deinstallieren … (Windows: Apps & Features)", self._apps)
+            act.setEnabled(os.name == "nt")
+        elif kind in ("System", "Temporär"):
+            act = m.addAction("🧽  Speicheroptimierung von Windows öffnen", self._storage_sense)
+            act.setEnabled(os.name == "nt")
+        elif kind == "Papierkorb":
+            act = m.addAction("🗑  Papierkorb leeren … (endgültig)", self._empty_bin)
+            act.setEnabled(os.name == "nt")
+        if kind in ("Datei", "Video", "Archiv", "Installer", "Ordner"):
+            m.addAction("🗑  In den Papierkorb …", lambda: self.trash_row(i))
+        m.exec(pos)
+
+    def _apps(self):
+        os.startfile("ms-settings:appsfeatures")
+
+    def _storage_sense(self):
+        os.startfile("ms-settings:storagesense")
+
+    def _empty_bin(self):
+        import ctypes
+        ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, 0)   # mit Windows-Rückfrage
+
+    def trash_row(self, i: int):
+        r = self.hogs.rows[i]
+        p = Path(r["path"])
+        warn = ""
+        if r["is_dir"]:
+            warn = ("\n\nEs ist ein ganzer Ordner. Prüfe vorher im Ordner-Assistenten, ob "
+                    "Wichtiges darin liegt.")
+        if QMessageBox.question(self, "In den Papierkorb",
+                                f"„{p.name}“ ({human_size(r['size'])}) in den Papierkorb "
+                                f"verschieben?{warn}\n\nAus dem Papierkorb wiederherstellbar – "
+                                f"Platz wird erst frei, wenn er geleert wird.") != QMessageBox.Yes:
+            return
+        if not safe_trash(p):
+            return QMessageBox.warning(self, "Papierkorb", f"„{p.name}“ nicht verschoben – "
+                                       f"{TRASH_FAIL_HINT}.")
+        rows = [x for x in self.hogs.rows if x is not r]
+        self._set_rows(rows, self.hogs.used)
+        self.res_title.setText(re.sub(r"^Die \d+ ", f"Die {len(rows)} ", self.res_title.text()))
+        self.results.pop(str(self.drives[self.current]["root"]), None)
+        self.res_sub.setText(self.res_sub.text() + "  ·  geändert – „Neu analysieren“ für aktuelle Werte")
+
+
 CLEANER_SORTS = ("Vorsortiert", "Älteste zuerst", "Größte zuerst")
 ORG_TIER_ORDER = {ORG_JUNK: 0, ORG_REVIEW: 1, ORG_KEEP: 2, ORG_PROTECT: 3}
 
 
-class CleanerWindow(_Base):
+class CleanerView(QWidget):
     """Downloads (oder jeden anderen Ordner bzw. eine übergebene Dateiliste) Datei für
-    Datei aufräumen. „Vorsortiert“: Müll-Vorschläge zuerst, Wichtiges zuletzt."""
+    Datei aufräumen. „Vorsortiert“: Müll-Vorschläge zuerst, Wichtiges zuletzt.
+    Seite im Hauptfenster; einzeln gezeigt (Tests) auch als eigenes Fenster nutzbar."""
 
-    def __init__(self, mgr: "FenceManager", folder: Path, entries: list | None = None,
-                 title: str | None = None, hints=None):
-        super().__init__()
-        self.mgr, self.folder = mgr, Path(folder)
+    def __init__(self, mgr: "FenceManager", folder: Path | None = None,
+                 entries: list | None = None, title: str | None = None, hints=None,
+                 autoload=True, parent=None):
+        super().__init__(parent)
+        self.mgr, self.folder = mgr, Path(folder or downloads_dir())
         self.fixed = [Path(p) for p in entries] if entries is not None else None
         self.hints = hints                  # vorhandener OrgPlan (aus dem Ordner-Assistenten)
         self.title_text = title or "Aufräumen"
+        self.on_finish = None               # Rücksprung, z. B. zum Ordner-Assistenten
         self.decisions: list[tuple[dict, str]] = []     # (Eintrag, "trash"|"keep")
         self.queue: list[dict] = []
         self.idx = 0
         self.committed = False
+        self.loaded = False
         self._presort: OrgWorker | None = None
+        self._research: ResearchJob | None = None
         self.setWindowTitle(self.title_text)
-        self.setWindowIcon(app_icon())
-        if FRAMELESS:
-            self.setTitleBar(TitleBar(self))
-            for b in (self.titleBar.minBtn, self.titleBar.maxBtn, self.titleBar.closeBtn):
-                b.setNormalColor(QColor(255, 255, 255, 200))
-                b.setHoverColor(Qt.white)
-        if ACRYLIC:
-            self.windowEffect.setAcrylicEffect(self.winId(), ACRYLIC_TINT)
         self._build()
         self.resize(620, 820)
-        self.load()
+        if autoload:
+            self.load()
 
     def _build(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(22, 40 if FRAMELESS else 22, 22, 22)
+        root.setContentsMargins(0, 0, 0, 0)
         head = QHBoxLayout()
         titles = QVBoxLayout()
         titles.setSpacing(2)
-        title = QLabel(self.title_text)
-        title.setObjectName("h1")
-        self.sub = QLabel("")
+        self.title_lbl = ElideLabel(self.title_text)
+        self.title_lbl.setObjectName("h2")
+        self.sub = ElideLabel("")
         self.sub.setObjectName("sub")
-        titles.addWidget(title)
+        titles.addWidget(self.title_lbl)
         titles.addWidget(self.sub)
-        head.addLayout(titles)
-        head.addStretch(1)
+        head.addLayout(titles, 1)
+        self.b_downloads = GlassButton("⬇  Downloads", small=True)
+        self.b_downloads.clicked.connect(lambda: self.set_source(downloads_dir()))
         self.b_folder = GlassButton("Ordner …", small=True)
         self.b_folder.clicked.connect(self.choose_folder)
-        self.b_folder.setVisible(self.fixed is None)
+        head.addWidget(self.b_downloads)
         self.b_sort = GlassButton(CLEANER_SORTS[0], small=True)
         self.b_sort.setToolTip("Sortierung wechseln: Vorsortiert (Müll-Vorschläge zuerst) · "
                                "Älteste zuerst · Größte zuerst")
@@ -12703,13 +13668,60 @@ class CleanerWindow(_Base):
         row.addStretch(1)
         root.addLayout(row)
         self.b_done = GlassButton("Fertig", primary=True)
-        self.b_done.clicked.connect(self.close)
+        self.b_done.clicked.connect(self.finish)
         root.addWidget(self.b_done, 0, Qt.AlignHCenter)
         self.setFocusPolicy(Qt.StrongFocus)
+        self._sync_header()
 
     def paintEvent(self, _):
-        p = QPainter(self)
-        paint_backdrop(p, self.rect(), overlay_only=ACRYLIC)
+        if self.isWindow():                  # nur als eigenes Fenster (Tests)
+            p = QPainter(self)
+            paint_backdrop(p, self.rect(), overlay_only=False)
+
+    def _sync_header(self):
+        name = self.folder.name or str(self.folder)
+        self.title_lbl.setText(f"🧹  {self.title_text}" + ("" if self.fixed is not None
+                                                          else f": {name}"))
+        self.b_folder.setVisible(self.fixed is None)
+        self.b_downloads.setVisible(self.fixed is None)
+        self.t_again.setVisible(self.fixed is None)
+
+    def set_source(self, folder: Path | None = None, entries: list | None = None,
+                   title: str | None = None, hints=None, on_finish=None):
+        """Anderen Ordner bzw. eine Dateiliste durchwischen. Offene Entscheidungen werden
+        vorher ausgeführt."""
+        self.commit_and_report()
+        self.folder = Path(folder or self.folder)
+        self.fixed = [Path(p) for p in entries] if entries is not None else None
+        self.title_text = title or "Aufräumen"
+        self.hints, self.on_finish = hints, on_finish
+        self.decisions, self.committed = [], False
+        self._sync_header()
+        self.load()
+
+    def pending(self) -> int:
+        return 0 if self.committed else sum(1 for _, a in self.decisions if a == "trash")
+
+    def commit_and_report(self):
+        n = self.pending()
+        failed = self.commit()
+        if failed:
+            QMessageBox.warning(self, "Papierkorb",
+                                f"Nicht in den Papierkorb verschoben ({TRASH_FAIL_HINT}):\n\n"
+                                + "\n".join(failed))
+        elif n:
+            self.mgr.notify.emit("Aufgeräumt", f"{n} Datei(en) im Papierkorb")
+        return n
+
+    def finish(self):
+        """„Fertig“: Markiertes in den Papierkorb, dann zurück bzw. neu laden."""
+        self.commit_and_report()
+        back, self.on_finish = self.on_finish, None
+        if back:
+            return back()
+        if self.isWindow():
+            return self.close()
+        self.set_source(self.folder)
 
     # ----- Daten -----
     def _kept(self) -> dict:
@@ -12722,6 +13734,7 @@ class CleanerWindow(_Base):
             return str(p)
 
     def load(self):
+        self.loaded = True
         kept = {} if (self.t_again.isChecked() or self.fixed is not None) else self._kept()
         protected = set(self.mgr.cfg.get("protected", []))
         if self.fixed is not None:
@@ -12775,6 +13788,28 @@ class CleanerWindow(_Base):
         if self.b_sort.text() == CLEANER_SORTS[0]:
             self.queue = self.queue[:self.idx] + self._sorted(self.queue[self.idx:])
         self.show_current()
+        self._start_research()
+
+    def _start_research(self):
+        """Recherche zu den Dateien (Installer, Archive, Videos …) – Ergebnis auf der Karte."""
+        on, srcs = research_settings(self.mgr.cfg)
+        files = [e["org"] for e in self.queue if e.get("org") and research_file_ok(e["org"])]
+        if not (on and srcs and files) or (self._research and self._research.is_running()):
+            return
+        items = [Item(f.path, "user", "file") for f in files]
+        self._research = ResearchJob(items, srcs, self,
+                                     query_fn=lambda it: research_file_query(it.path))
+        self._research.finished.connect(self._research_done)
+        self._research.start()
+
+    def _research_done(self, results: dict, _status: dict):
+        for e in self.queue:
+            res = results.get(str(e["path"]))
+            if res and res.get("evidence"):
+                first = res["evidence"][0]
+                cat = f" → {res['category']}" if res.get("category") else ""
+                e["research"] = f"🔎 {first['label']} – {first['text']}{cat}"
+        self.card.update()
 
     def _sorted(self, entries: list[dict]) -> list[dict]:
         mode = self.b_sort.text()
@@ -12877,7 +13912,8 @@ class CleanerWindow(_Base):
         junk = self._suggested_junk()
         self.b_bulk.setVisible(bool(junk))
         if junk:
-            self.b_bulk.setText(f"🗑  Alle {len(junk)} Vorschläge → Papierkorb")
+            self.b_bulk.setText("🗑  1 Vorschlag → Papierkorb" if len(junk) == 1
+                                else f"🗑  Alle {len(junk)} Vorschläge → Papierkorb")
             self.b_bulk.updateGeometry()
         self.b_done.setText(f"Fertig – {len(trash)} in den Papierkorb" if trash else "Fertig")
         self.b_done.updateGeometry()
@@ -12915,9 +13951,7 @@ class CleanerWindow(_Base):
         folder = QFileDialog.getExistingDirectory(self, "Ordner zum Aufräumen wählen",
                                                   str(self.folder))
         if folder:
-            self.commit()
-            self.folder, self.decisions, self.committed = Path(folder), [], False
-            self.load()
+            self.set_source(Path(folder))
 
     def keyPressEvent(self, e):
         k = e.key()
@@ -12930,7 +13964,7 @@ class CleanerWindow(_Base):
         elif k == Qt.Key_Backspace or (k == Qt.Key_Z and e.modifiers() & Qt.ControlModifier):
             self.undo()
         elif k == Qt.Key_Escape:
-            self.close()
+            self.finish()
         else:
             super().keyPressEvent(e)
 
@@ -12952,14 +13986,9 @@ class CleanerWindow(_Base):
         if self._presort and self._presort.isRunning():
             self._presort.cancel()
             self._presort.wait(5000)
-        n = sum(1 for _, a in self.decisions if a == "trash")
-        failed = self.commit()
-        if failed:
-            QMessageBox.warning(self, "Papierkorb",
-                                f"Nicht in den Papierkorb verschoben ({TRASH_FAIL_HINT}):\n\n"
-                                + "\n".join(failed))
-        elif n:
-            self.mgr.notify.emit("Aufgeräumt", f"{n} Datei(en) im Papierkorb")
+        if self._research:
+            self._research.cancel = True
+        self.commit_and_report()
         super().closeEvent(e)
 
 
@@ -13036,7 +14065,7 @@ class OrgTile(QAbstractButton):
         self.value, self.sub = "–", ""
         self.setCheckable(True)
         self.setCursor(Qt.PointingHandCursor)
-        self.setMinimumSize(170, 92)
+        self.setMinimumSize(138, 92)
         self._hover = False
 
     def set_value(self, value: str, sub: str = ""):
@@ -13062,7 +14091,8 @@ class OrgTile(QAbstractButton):
         p.setFont(f)
         p.setPen(self.color.lighter(140))
         p.drawText(QRectF(16, 12, r.width() - 24, 20), Qt.AlignLeft | Qt.AlignVCenter,
-                   f"{self.glyph}  {self.title}")
+                   p.fontMetrics().elidedText(f"{self.glyph}  {self.title}", Qt.ElideRight,
+                                              int(r.width() - 26)))
         f.setPixelSize(26)
         f.setWeight(QFont.Bold)
         p.setFont(f)
@@ -13079,6 +14109,7 @@ class OrgTile(QAbstractButton):
 ORG_SECTIONS = [
     # Schlüssel, Titel, Symbol, Farbe
     ("moves", "Neue Ordnung", "🗂", "#0A84FF"),
+    ("research", "Recherche", "🔎", "#5E5CE6"),
     ("protect", "Wichtig & dauerhaft", "🔒", "#30D158"),
     ("dups", "Duplikate", "⧉", "#FF9F0A"),
     ("versions", "Alte Versionen", "🕘", "#BF5AF2"),
@@ -13088,44 +14119,108 @@ ORG_SECTIONS = [
 ]
 
 
-class OrganizerWindow(_Base):
-    """Analysiert einen beliebigen Ordner, schlägt Ordnung vor und räumt sicher auf."""
+ORG_QUICK_FOLDERS = [("🖥", "Desktop", "desktop"), ("📄", "Dokumente", "documents"),
+                     ("⬇", "Downloads", "downloads"), ("🖼", "Bilder", "pictures"),
+                     ("🎬", "Videos", "videos"), ("🎵", "Musik", "music")]
 
-    def __init__(self, mgr: "FenceManager", folder: Path):
-        super().__init__()
+
+def org_move_into(files: list, dest: Path) -> tuple:
+    """Dateien in einen anderen Ordner legen (nie überschreiben). Protokoll im Format von
+    org_undo, damit „Letzte Sortierung rückgängig“ auch das zurücknimmt.
+    → (Anzahl, Fehlermeldungen, Protokoll oder None bei verschiedenen Laufwerken)."""
+    dest = Path(dest)
+    moves, failed = [], []
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        root = Path(os.path.commonpath([str(dest)] + [str(Path(f.path).parent) for f in files]))
+    except ValueError:                                   # anderes Laufwerk
+        root = None
+    except OSError as e:
+        return 0, [f"{dest}: {e.strerror or e}"], None
+    journal = None
+    if root is not None:
+        JOURNAL_DIR.mkdir(exist_ok=True)
+        stamp, n = time.strftime("%Y%m%d-%H%M%S"), 1
+        journal = JOURNAL_DIR / f"organize-{stamp}.json"
+        while journal.exists():
+            n += 1
+            journal = JOURNAL_DIR / f"organize-{stamp}-{n}.json"
+    for f in files:
+        src = Path(f.path)
+        if not src.is_file():
+            failed.append(f"{src.name}: nicht mehr vorhanden")
+            continue
+        if src.parent == dest:
+            continue
+        target = unique_dest(dest, src.name)
+        try:
+            shutil.move(str(src), str(target))
+        except OSError as e:
+            failed.append(f"{src.name}: {e.strerror or e}")
+            continue
+        moves.append([str(src), str(target)])
+        if journal:
+            journal.write_text(json.dumps({"root": str(root), "created": [], "moves": moves},
+                                          ensure_ascii=False, indent=1), encoding="utf-8")
+    return len(moves), failed, journal
+
+
+def org_research_dest(f, category: str) -> str:
+    """Zielordner nach der Recherche: Installer und Archive nach Thema
+    („Programme & Installer/Spiele“), Unbekanntes unter „Sonstiges/<Thema>“."""
+    base = org_dest_for(f)
+    if not category:
+        return base
+    if f.kind in ("installer", "archive") or not base:
+        return f"{base or 'Sonstiges'}/{category}"
+    return base
+
+
+class OrganizerView(QWidget):
+    """Analysiert einen beliebigen Ordner, schlägt Ordnung vor und räumt sicher auf –
+    mit Recherche zu Installern, Archiven, Videos & Co. Seite im Hauptfenster."""
+
+    def __init__(self, mgr: "FenceManager", folder: Path, autostart=True, boxes_fn=None,
+                 parent=None):
+        super().__init__(parent)
         self.mgr, self.folder = mgr, Path(folder)
         self.plan = None
+        self.boxes_fn = boxes_fn                       # → {Name: Ordner} der Desktop-Boxen
+        self.on_swipe = None                           # fn(Dateien, Titel, Plan) im Hauptfenster
+        self.research: dict[str, dict] = {}           # Pfad → Ergebnis der Recherche
+        self._research: ResearchJob | None = None
         self._worker: OrgWorker | None = None
         self.setWindowTitle("Ordner-Assistent")
-        self.setWindowIcon(app_icon())
-        if FRAMELESS:
-            self.setTitleBar(TitleBar(self))
-            for b in (self.titleBar.minBtn, self.titleBar.maxBtn, self.titleBar.closeBtn):
-                b.setNormalColor(QColor(255, 255, 255, 200))
-                b.setHoverColor(Qt.white)
-        if ACRYLIC:
-            self.windowEffect.setAcrylicEffect(self.winId(), ACRYLIC_TINT)
         self._build()
         self.resize(1240, 860)
-        QTimer.singleShot(0, self.analyze)
+        if autostart:
+            QTimer.singleShot(0, self.analyze)
 
     # ---------- Aufbau ----------
     def _build(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(22, 40 if FRAMELESS else 22, 22, 18)
+        root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(12)
 
         head = QHBoxLayout()
         titles = QVBoxLayout()
         titles.setSpacing(2)
-        t = QLabel("Ordner-Assistent")
-        t.setObjectName("h1")
-        self.sub = QLabel("")
+        self.title_lbl = ElideLabel("📁  Ordner-Assistent")
+        self.title_lbl.setObjectName("h2")
+        self.sub = ElideLabel("")
         self.sub.setObjectName("sub")
-        titles.addWidget(t)
+        titles.addWidget(self.title_lbl)
         titles.addWidget(self.sub)
-        head.addLayout(titles)
-        head.addStretch(1)
+        head.addLayout(titles, 1)
+        self.quick: dict[str, GlassButton] = {}
+        for glyph, label, key in ORG_QUICK_FOLDERS:
+            b = GlassButton(f"{glyph}  {label}", small=True)
+            b.clicked.connect(lambda _=False, k=key: self.set_folder(org_known_folder(k)))
+            self.quick[key] = b
+            head.addWidget(b)
+        head.addSpacing(10)
+        root.addLayout(head)
+        head = QHBoxLayout()
         self.t_recursive = Toggle("Unterordner einbeziehen", checked=True)
         self.t_reorg = Toggle("Unterordner neu ordnen")
         self.t_recursive.toggled.connect(lambda _: self.analyze())
@@ -13137,6 +14232,7 @@ class OrganizerWindow(_Base):
         for w in (self.t_recursive, self.t_reorg):
             head.addWidget(w)
             head.addSpacing(8)
+        head.addStretch(1)
         head.addWidget(self.b_folder)
         head.addWidget(self.b_again)
         root.addLayout(head)
@@ -13214,7 +14310,7 @@ class OrganizerWindow(_Base):
         root.addWidget(self.panel, 1)
         self.current = "moves"
         self.busy_widgets = [self.b_folder, self.b_again, self.t_recursive, self.t_reorg,
-                             self.panel] + list(self.tiles.values())
+                             self.panel] + list(self.tiles.values()) + list(self.quick.values())
 
     def _make_tree(self) -> QTreeWidget:
         t = QTreeWidget()
@@ -13237,8 +14333,18 @@ class OrganizerWindow(_Base):
         return t
 
     def paintEvent(self, _):
-        p = QPainter(self)
-        paint_backdrop(p, self.rect(), overlay_only=ACRYLIC)
+        if self.isWindow():                  # nur als eigenes Fenster (Tests)
+            p = QPainter(self)
+            paint_backdrop(p, self.rect(), overlay_only=False)
+
+    def set_folder(self, folder: Path):
+        if self._worker and self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait(3000)
+        self.folder = Path(folder)
+        self.plan = None
+        self.populate()
+        self.analyze()
 
     # ---------- Analyse ----------
     def _protected(self) -> set:
@@ -13268,7 +14374,11 @@ class OrganizerWindow(_Base):
                                protected_paths=protected)
 
         self.set_busy("Analysiere …")
-        self.sub.setText(f"{self.folder.name or self.folder}")
+        if self._research:
+            self._research.cancel = True
+        self.research = {}
+        self.title_lbl.setText(f"📁  {self.folder.name or self.folder}")
+        self.sub.setText(str(self.folder))
         self.sub.setToolTip(str(self.folder))
         self._worker = OrgWorker(job, self)
         self._worker.progress.connect(self._on_progress)
@@ -13297,9 +14407,58 @@ class OrganizerWindow(_Base):
         st = plan.stats
         note = "  ·  ⚠ nur die ersten Dateien analysiert" if plan.truncated else ""
         self.sub.setToolTip(str(self.folder))
-        self.sub.setText(f"{self.folder.name or self.folder}  ·  {st.get('files', len(plan.files)):,} Dateien  ·  "
-                         f"{human_size(st.get('bytes', 0))}  ·  {st.get('seconds', 0):.1f} s"
-                         .replace(",", ".") + note)
+        self.sub.setText(f"{self.folder}  ·  {st.get('files', len(plan.files)):,} Dateien  ·  "
+                         f"{human_size(st.get('bytes', 0)).replace(',', '#')}  ·  "
+                         f"{st.get('seconds', 0):.1f} s".replace(",", ".").replace("#", ",")
+                         + note)
+        self.populate()
+        self._start_research()
+
+    # ---------- Recherche ----------
+    def _research_files(self) -> list:
+        return [f for f in self.plan.files if research_file_ok(f) and research_file_query(f.path)]
+
+    def _start_research(self):
+        on, srcs = research_settings(self.mgr.cfg)
+        files = self._research_files() if self.plan else []
+        if not (on and srcs and files):
+            self.tiles["research"].set_value("–", "Recherche aus" if not (on and srcs)
+                                             else "nichts nachzuschlagen")
+            return
+        if self._research:
+            self._research.cancel = True
+        items = [Item(f.path, "user", "file") for f in files]
+        self._research = job = ResearchJob(items, srcs, self,
+                                           query_fn=lambda it: research_file_query(it.path))
+        job.progress.connect(lambda n, total, name: job is self._research and
+                             self.tiles["research"].set_value(f"{n}/{total}", f"prüfe „{name}“ …"))
+        job.finished.connect(lambda res, st, j=job: self._research_done(j, res, st))
+        self.tiles["research"].set_value("…", f"{len(files)} Dateien werden geprüft")
+        job.start()
+
+    def _research_done(self, job, results: dict, status: dict):
+        if job is not self._research or job.cancel or self.plan is None:
+            return
+        self._research = None
+        self.research = results
+        self.research_status = status
+        by_path = {str(f.path): f for f in self.plan.files}
+        for path, res in results.items():
+            f = by_path.get(path)
+            if f is None or not res.get("evidence"):
+                continue
+            first = res["evidence"][0]
+            f.add_reason(f"🔎 {first['label']} – {first['text']}"
+                         + (f" ({', '.join(res['agree'])})" if res.get("agree") else ""))
+            dest = org_research_dest(f, res.get("category", ""))
+            parent = Path(f.rel).parent.as_posix()
+            if dest and not (parent == dest or parent.startswith(dest + "/")) \
+                    and f.tier != ORG_JUNK:
+                old = next((m for m in self.plan.moves if m.file is f), None)
+                if old:
+                    old.dest_rel = dest
+                else:
+                    self.plan.moves.append(OrgMove(f, dest, False))
         self.populate()
 
     # ---------- Darstellung ----------
@@ -13347,6 +14506,27 @@ class OrganizerWindow(_Base):
                 it.setData(1, Qt.UserRole, i)
                 g.addChild(it)
             g.setExpanded(len(groups) <= 12)
+        # Recherche – nach Thema laut offenen Quellen
+        t = self.trees["research"]
+        by_path = {str(f.path): f for f in plan.files}
+        topics: dict[str, list] = {}
+        for path, res in self.research.items():
+            f = by_path.get(path)
+            if f is not None:
+                topics.setdefault(res.get("category") or ("Gefunden, ohne Thema"
+                                  if res.get("evidence") else "Kein Treffer"), []).append((f, res))
+        order = sorted(topics, key=lambda k: (k in ("Gefunden, ohne Thema", "Kein Treffer"), k))
+        for topic in order:
+            g = self._group_item(t, f"🔎  {topic}", f"{len(topics[topic])} Datei(en)")
+            for f, res in sorted(topics[topic], key=lambda fr: fr[0].rel.lower()):
+                lines = research_lines(res)
+                it = self._file_item(f, bool(res.get("category")) and f.tier != ORG_JUNK,
+                                     lines[0] if lines else "in keiner Quelle gefunden")
+                it.setToolTip(1, "\n".join(lines) or "in keiner Quelle gefunden")
+                dest = org_research_dest(f, res.get("category", ""))
+                it.setData(1, Qt.UserRole + 3, dest)
+                g.addChild(it)
+            g.setExpanded(len(order) <= 8)
         # Wichtig – nach Kategorie
         t = self.trees["protect"]
         cats: dict[str, list] = {}
@@ -13429,6 +14609,9 @@ class OrganizerWindow(_Base):
         rest = [f for f in p.junk if not f.dup_of]
         olds = [f for g in p.versions.values() for f in g if not f.version_latest]
         self.tiles["moves"].set_value(str(len(p.moves)), f"in {len({m.dest_rel for m in p.moves})} Ordner")
+        if self.research:
+            found = sum(1 for r in self.research.values() if r.get("category"))
+            self.tiles["research"].set_value(str(found), f"von {len(self.research)} zugeordnet")
         self.tiles["protect"].set_value(str(len(p.protect)), "nie zum Löschen vorgeschlagen")
         self.tiles["dups"].set_value(human_size(sum(f.size for f in dup_copies)),
                                      f"{len(dup_copies)} Kopien")
@@ -13440,6 +14623,11 @@ class OrganizerWindow(_Base):
             p.files, key=lambda f: -f.size)[:60])), "die 60 größten")
 
     SECTION_INFO = {
+        "research": ("Recherche in offenen Quellen",
+                     "Installer, Archive, Videos, Musik und Unbekanntes werden in Wikidata, "
+                     "Wikipedia, Flathub und Chocolatey nachgeschlagen (nur der bereinigte Name; "
+                     "nie Dokumente oder Fotos). Häkchen = nach Thema einsortieren.",
+                     "Ausgewählte nach Thema einsortieren", "Ausgewählte in den Papierkorb"),
         "moves": ("Vorgeschlagene Ordnung",
                   "Dateien werden innerhalb dieses Ordners in Unterordner verschoben – nichts wird gelöscht. "
                   "Häkchen = übernehmen. Rückgängig jederzeit möglich.",
@@ -13508,6 +14696,11 @@ class OrganizerWindow(_Base):
         key = self.current
         if key == "moves":
             return self.apply_moves()
+        if key == "research":
+            files = self._checked_files("research")
+            if secondary:
+                return self.trash(files)
+            return self.apply_research_moves()
         if key == "protect":
             return self.remember_protected() if secondary else self.backup_vault()
         files = self._checked_files(key)
@@ -13536,6 +14729,48 @@ class OrganizerWindow(_Base):
         if failed:
             msg += "\n\nNicht verschoben:\n" + "\n".join(failed[:15])
         QMessageBox.information(self, "Ordner-Assistent", msg)
+        self.analyze()
+
+    def apply_research_moves(self):
+        moves = [OrgMove(it.data(0, Qt.UserRole), it.data(1, Qt.UserRole + 3), True)
+                 for it in self._iter_items(self.trees["research"])
+                 if it.data(0, Qt.UserRole) is not None and it.checkState(0) == Qt.Checked
+                 and it.data(1, Qt.UserRole + 3)]
+        moves = [m for m in moves if Path(m.file.rel).parent.as_posix() != m.dest_rel]
+        if not moves:
+            return QMessageBox.information(self, "Ordner-Assistent", "Nichts ausgewählt.")
+        if QMessageBox.question(self, "Nach Thema einsortieren",
+                                f"{len(moves)} Datei(en) in {len({m.dest_rel for m in moves})} "
+                                f"Ordner einsortieren?\n\nRückgängig jederzeit möglich.") \
+                != QMessageBox.Yes:
+            return
+        JOURNAL_DIR.mkdir(exist_ok=True)
+        journal = JOURNAL_DIR / f"organize-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        moved, failed = org_apply_moves(self.plan, moves, journal)
+        msg = f"{moved} Dateien einsortiert."
+        if failed:
+            msg += "\n\nNicht verschoben:\n" + "\n".join(failed[:15])
+        QMessageBox.information(self, "Ordner-Assistent", msg)
+        self.analyze()
+
+    def move_files(self, files: list, dest: Path):
+        """Einordnen in einen anderen Ordner (Dokumente, Bilder, Desktop-Box …)."""
+        files = [f for f in files if not f.in_project]
+        if not files:
+            return
+        same_drive = os.path.splitdrive(str(dest))[0].lower() == \
+            os.path.splitdrive(str(self.folder))[0].lower()
+        if QMessageBox.question(self, "Verschieben",
+                                f"{len(files)} Datei(en) nach\n{dest}\nverschieben?"
+                                + ("" if same_drive else "\n\nAnderes Laufwerk – wird kopiert "
+                                   "und kann nicht automatisch rückgängig gemacht werden.")) \
+                != QMessageBox.Yes:
+            return
+        moved, failed, _journal = org_move_into(files, dest)
+        msg = f"{moved} Datei(en) verschoben nach {dest}."
+        if failed:
+            msg += "\n\nNicht verschoben:\n" + "\n".join(failed[:15])
+        QMessageBox.information(self, "Verschieben", msg)
         self.analyze()
 
     def trash(self, files: list, dirs: list = ()):
@@ -13619,8 +14854,11 @@ class OrganizerWindow(_Base):
         files = [f for f in files if f.tier != ORG_PROTECT or f.dup_of]
         if not files:
             return
-        win = CleanerWindow(self.mgr, self.folder, entries=[f.path for f in files],
-                            title=self.SECTION_INFO[self.current][0], hints=self.plan)
+        title = self.SECTION_INFO[self.current][0]
+        if self.on_swipe:                              # im Hauptfenster: Seite „Aufräumen“
+            return self.on_swipe([f.path for f in files], title, self.plan)
+        win = CleanerView(self.mgr, self.folder, entries=[f.path for f in files],
+                          title=title, hints=self.plan)
         win.destroyed.connect(self._after_swipe)
         win.setAttribute(Qt.WA_DeleteOnClose)
         win.show()
@@ -13655,8 +14893,7 @@ class OrganizerWindow(_Base):
     def choose_folder(self):
         d = QFileDialog.getExistingDirectory(self, "Ordner analysieren", str(self.folder))
         if d:
-            self.folder = Path(d)
-            self.analyze()
+            self.set_folder(Path(d))
 
     # ---------- Kontextmenü ----------
     def _open_item(self, it, _col=0):
@@ -13670,8 +14907,19 @@ class OrganizerWindow(_Base):
         if f is None:
             return
         m = glass_menu(self)
+        sel = [x.data(0, Qt.UserRole) for x in tree.selectedItems()
+               if x.data(0, Qt.UserRole) is not None]
+        files = sel if f in sel else [f]
         m.addAction("▶  Öffnen", lambda: self.mgr.launch(str(f.path)))
         m.addAction("↗  Im Explorer zeigen", lambda: reveal_path(str(f.path)))
+        res = self.research.get(str(f.path))
+        if res and res.get("evidence"):
+            info = m.addAction("🔎  " + research_lines(res)[0][:90])
+            info.setEnabled(False)
+        m.addSeparator()
+        m.addMenu(self._move_menu(m, files))
+        m.addAction(f"🗑  In den Papierkorb …" + (f" ({len(files)})" if len(files) > 1 else ""),
+                    lambda: self.trash(files))
         m.addSeparator()
         cat = glass_menu(m, "Kategorie ändern")
         for key, c in ORG_CATEGORIES.items():
@@ -13686,6 +14934,34 @@ class OrganizerWindow(_Base):
                     lambda: self.toggle_protect(f, not prot))
         m.addAction("🚫  Nicht anfassen (ausblenden)", lambda: self.ignore(f))
         m.exec(tree.viewport().mapToGlobal(pos))
+
+    def _move_menu(self, parent: QMenu, files: list) -> QMenu:
+        """„Verschieben nach“: Zielordner aus dem Plan, Standardordner, Desktop-Boxen."""
+        mm = glass_menu(parent, "📦  Verschieben nach")
+        if self.plan is not None:
+            dests = sorted({org_dest_for(f) for f in files if org_dest_for(f)})
+            for d in dests:
+                mm.addAction(f"🗂  {d}  (hier)", lambda d=d: self.move_files(files, self.folder / d))
+            if dests:
+                mm.addSeparator()
+        for glyph, label, key in ORG_QUICK_FOLDERS:
+            target = org_known_folder(key)
+            if os.path.normcase(str(target)) != os.path.normcase(str(self.folder)):
+                mm.addAction(f"{glyph}  {label}", lambda t=target: self.move_files(files, t))
+        boxes = self.boxes_fn() if self.boxes_fn else {}
+        if boxes:
+            bm = glass_menu(mm, "▣  Desktop-Box")
+            for name, folder in boxes.items():
+                bm.addAction(name, lambda d=folder: self.move_files(files, d))
+            mm.addMenu(bm)
+        mm.addSeparator()
+        mm.addAction("Anderer Ordner …", lambda: self._move_pick(files))
+        return mm
+
+    def _move_pick(self, files: list):
+        d = QFileDialog.getExistingDirectory(self, "Zielordner wählen", str(self.folder))
+        if d:
+            self.move_files(files, Path(d))
 
     def recategorize(self, f: OrgFile, key: str):
         f.category = key
@@ -13733,6 +15009,8 @@ class OrganizerWindow(_Base):
         if self._worker and self._worker.isRunning():
             self._worker.cancel()
             self._worker.wait(3000)
+        if self._research:
+            self._research.cancel = True
         super().closeEvent(e)
 
 
@@ -13897,12 +15175,12 @@ def run_app(app: QApplication, args) -> None:
     server.listen(server_name)
 
     app.setQuitOnLastWindowClosed(False)
+    state = {"win": None}
     fences = FenceManager(args.storage, args.rules, args.memory)
     fences.sync()
     app.aboutToQuit.connect(fences.hook.stop)
     # Offene Aufräum-Entscheidungen beim Beenden noch ausführen
-    app.aboutToQuit.connect(lambda: getattr(fences, "_cleaner", None)
-                            and fences._cleaner.isVisible() and fences._cleaner.close())
+    app.aboutToQuit.connect(lambda: state["win"] and state["win"].cleaner.commit_and_report())
     # Autostart: Verknüpfung bei jedem Start (neu) anlegen – zeigt so auch nach
     # dem Verschieben der .pyw oder einer neuen Python-Umgebung auf die richtige Stelle.
     if Win32.ok and fences.settings["autostart"]:
@@ -13915,7 +15193,6 @@ def run_app(app: QApplication, args) -> None:
     reminder = QTimer(app, interval=6 * 3600 * 1000)
     reminder.timeout.connect(fences.check_downloads_reminder)
     reminder.start()
-    state = {"win": None}
 
     def open_manager():
         win = state["win"]
@@ -13928,6 +15205,12 @@ def run_app(app: QApplication, args) -> None:
         win.activateWindow()
 
     fences.openManager.connect(open_manager)
+
+    def open_page(page: str, folder):
+        open_manager()
+        state["win"].show_page(page, folder)
+
+    fences.pageRequested.connect(open_page)          # Ordner-Assistent & Co. als Seite
 
     def on_connection():
         conn = server.nextPendingConnection()

@@ -27,13 +27,24 @@ Die Datei **nicht auf den Desktop** legen, sonst sortiert sie sich selbst mit ei
 
 ## Das Hauptfenster
 
-Alle Funktionen sind von hier aus erreichbar:
+Alles läuft in **einem Fenster** – oben rechts schaltest du zwischen vier Seiten um, es gehen keine weiteren Fenster auf:
+
+| Seite | Wofür |
+|---|---|
+| 🖥 **Desktop** | Desktop-Symbole und -Ordner thematisch in Glas-Boxen sortieren (unten) |
+| 📁 **Ordner** | Ordner-Assistent für Desktop, Dokumente, Downloads, Bilder, Videos, Musik oder jeden anderen Ordner – mit Recherche, Einsortieren, Verschieben nach, Papierkorb |
+| 🧹 **Aufräumen** | Dateien im Tinder-Stil durchwischen (Downloads oder jeder Ordner) |
+| 💾 **Speicher** | Die 20 größten Platzfresser je Laufwerk („World of Warcraft 200 GB, Diablo IV 90 GB …“) |
+
+Tray-Menü, Explorer-Rechtsklick und Erinnerungen öffnen jeweils die passende Seite.
+
+Auf der Seite **Desktop** sind alle Funktionen von hier aus erreichbar:
 
 | Bereich | Knöpfe |
 |---|---|
 | Kopfzeile | *Öffentlicher Desktop* · *Ordner einbeziehen* · **↻ Neu scannen** · **In Boxen sortieren** |
 | Sortieren | **🔎 Recherche ▾** (Quellen, alles neu prüfen, Zwischenspeicher) · **↶ Rückgängig** |
-| Aufräumen | **📁 Ordner-Assistent ▾** (Dokumente, Downloads, Bilder, Desktop, Videos, anderer Ordner) · **🧹 Downloads** (Tinder-Stil) · **🗑 Papierkorb** |
+| Aufräumen | **📁 Ordner-Assistent ▾** (springt zur Seite *Ordner*) · **🧹 Downloads** (Seite *Aufräumen*) · **🗑 Papierkorb** |
 | Boxen | **+ Neue Box** · **▦ Anordnen** · **◐ Aus-/Einblenden** · **☰ Mehr ▾** (Ordner-Boxen, Layouts, Einstellungen, regeln.toml, Beenden) |
 
 | Karte / Liste | Bedeutung |
@@ -112,14 +123,15 @@ Position, Größe, Einklapp-Zustand und Darstellung jeder Box werden gespeichert
 
 Alle Schalter liegen im Tray-Menü unter **Einstellungen**, Layouts unter **Layouts**.
 
-## Ordner-Assistent – jeden Ordner aufräumen & sortieren
+## Seite „Ordner“ – jeden Ordner aufräumen & sortieren
 
-Rechtsklick auf einen Ordner im Explorer → **Mit Desktop Sorter aufräumen** (unter Windows 11 in *Weitere Optionen anzeigen*), oder Tray → **📁 Ordner-Assistent** → Dokumente / Downloads / Bilder / Desktop / Videos / *Anderer Ordner …*. Der Assistent analysiert alle Dateien – auch den **Inhalt** von PDFs, Word-, Excel-, PowerPoint-, OpenOffice- und Textdateien sowie die **EXIF-Daten** von Fotos – und schlägt vor, was wichtig ist, was weg kann und wohin der Rest gehört. Die Erkennung ist **zweisprachig (Deutsch + Englisch)**.
+Schnellwahl oben: **Desktop · Dokumente · Downloads · Bilder · Videos · Musik** oder *Ordner …*. Auch per Rechtsklick auf einen Ordner im Explorer → **Mit Desktop Sorter aufräumen** (unter Windows 11 in *Weitere Optionen anzeigen*) oder Tray → **📁 Ordner-Assistent**. Der Assistent analysiert alle Dateien – auch den **Inhalt** von PDFs, Word-, Excel-, PowerPoint-, OpenOffice- und Textdateien sowie die **EXIF-Daten** von Fotos – und schlägt vor, was wichtig ist, was weg kann und wohin der Rest gehört. Die Erkennung ist **zweisprachig (Deutsch + Englisch)**.
 
 ![Ordner-Assistent – vorgeschlagene Ordnung](docs/assistent_ordnung.png)
 
 | Bereich | Was du bekommst |
 |---|---|
+| 🔎 **Recherche** | Installer, Archive, Videos, Musik, 3D-Modelle und Unbekanntes werden in Wikidata, Wikipedia, Flathub und Chocolatey nachgeschlagen: `SteamSetup.exe` → *Steam – Launcher …* → `Programme & Installer/Spiele-Launcher & Tools`, `Interstellar.2014.1080p….mkv` → *Film von Christopher Nolan*, `arduino-ide_2.3.6_Windows_64bit.msi` → *Entwicklung*. Gruppiert nach Thema; *Ausgewählte nach Thema einsortieren* oder *in den Papierkorb*. Das Ergebnis steht auch bei jeder Datei im Grund |
 | 🗂 **Neue Ordnung** | Zielordner wie `Dokumente/Bewerbung`, `Dokumente/Steuer/2022`, `Dokumente/Rechnungen/2024`, `Bilder/Fotos/2023/2023-07-12 bis 07-15 – Reise`. Nur Verschieben innerhalb des Ordners, mit **Rückgängig** (Journal) |
 | 🔒 **Wichtig & dauerhaft** | Lebenslauf/CV, Anschreiben, Zeugnisse, Urkunden, Ausweise, Verträge, Versicherungen, Steuer, Gehalt & Rente, Gesundheit, Wohnen, **persönliche Fotos & Videos** – werden **nie** zum Löschen vorgeschlagen. *Als geschützt merken* schützt sie auch in allen anderen Funktionen. **🗄 Im Tresor sichern**: inkrementelle Kopie mit Prüfsummen-Kontrolle z. B. nach OneDrive oder auf eine externe Festplatte |
 | ⧉ **Duplikate** | Byte-identische Kopien (Prüfsumme). Das Original bleibt immer – bevorzugt die sinnvoll benannte, wichtige Fassung (`Personalausweis.jpg` statt `IMG_4567.JPG`) |
@@ -132,6 +144,8 @@ Fotos: Kamera- und Handy-Fotos (EXIF-Hersteller/-Modell, `IMG_…`, `PXL_…`, `
 
 ![Ordner-Assistent – wichtige Dateien](docs/assistent_wichtig.png)
 
+![Ordner-Assistent – Recherche zu Downloads](docs/assistent_recherche.png)
+
 **Sicherheit:**
 - Gelöscht wird nichts ohne Bestätigung, und nur in den **Papierkorb**. Auf Laufwerken ohne Papierkorb (USB-Stick, Netzlaufwerk) wird gar nicht gelöscht.
 - Wichtige Dateien, Projektordner (`.git`, Code-Projekte), Programm-, System- und AppData-Ordner, Junctions/Links und **OneDrive-Dateien „nur online“** werden nie angefasst. Letztere werden auch nie gelesen, damit kein Download ausgelöst wird.
@@ -139,11 +153,13 @@ Fotos: Kamera- und Handy-Fotos (EXIF-Hersteller/-Modell, `IMG_…`, `PXL_…`, `
 - Ein Duplikat wird nur gelöscht, wenn sein Original unverändert existiert.
 - Verschoben wird standardmäßig nur, was lose im gewählten Ordner liegt. *Unterordner neu ordnen* ist optional, und eigene Unterordner bleiben dabei erhalten.
 
-Rechtsklick auf eine Datei im Assistenten: Öffnen · Im Explorer zeigen · Kategorie ändern · Schützen · Nicht anfassen.
+Rechtsklick auf eine (oder mehrere markierte) Datei(en): Öffnen · Im Explorer zeigen · Recherche-Ergebnis · **📦 Verschieben nach** (vorgeschlagener Unterordner, **Dokumente, Bilder, Videos, Musik, Downloads, Desktop**, eine **Desktop-Box** oder *Anderer Ordner …*) · **🗑 In den Papierkorb** · Kategorie ändern · Schützen · Nicht anfassen. Auch *Verschieben nach* lässt sich mit **Letzte Sortierung rückgängig** umkehren (gleiches Laufwerk).
 
-## Downloads aufräumen
+**Recherche bei Dateien – was gesendet wird:** nur der bereinigte Name von Installern, Archiven, Videos, Musik, 3D-Modellen, Anleitungen und unbekannten Dateitypen (Versionsnummern, `x64`, `Setup`, `1080p`, `BluRay` … werden entfernt). **Nie** Dokumente wie Lebenslauf, Verträge oder Rechnungen, nie Fotos, nie Kamera-/Handy-Namen (`IMG_0001`, `WhatsApp Video …`), nie Projekt- oder OneDrive-„nur online“-Dateien.
 
-Tray → **🧹 Downloads aufräumen …** (oder bei einer Ordner-Box: Rechtsklick → *Ordner aufräumen …*). Jede Datei erscheint als Karte mit Vorschau – Bild, erste PDF-Seite, Textanfang oder Programmsymbol – samt Größe, Datum und Herkunft („von github.com“, aus dem Windows-Download-Vermerk).
+## Seite „Aufräumen“ – Downloads im Tinder-Stil
+
+Seite **🧹 Aufräumen** (oder Tray → *Downloads aufräumen*, bei einer Ordner-Box Rechtsklick → *Ordner aufräumen …*, im Ordner-Assistenten *Einzeln durchwischen*). Jede Datei erscheint als Karte mit Vorschau – Bild, erste PDF-Seite, Textanfang oder Programmsymbol – samt Größe, Datum, Herkunft („von github.com“, aus dem Windows-Download-Vermerk) und **Recherche-Ergebnis** („🔎 Factorio – Computerspiel von Wube Software → Spiele“).
 
 **Vorsortiert:** Die Analyse des Ordner-Assistenten läuft im Hintergrund mit. Löschvorschläge (Duplikate, installierte Installer, Reste) kommen zuerst, Wichtiges zuletzt; jede Karte zeigt einen farbigen **Grund** („Vorschlag: Papierkorb – Exakte Kopie von foto.jpg“, „🔒 Wichtig – Lebenslauf & Bewerbung“). **Alle N Vorschläge → Papierkorb** markiert sie auf einmal (einzeln rückgängig). Wer etwas Wichtiges oder die letzte Kopie einer Datei nach links wischt, wird gefragt.
 
@@ -156,10 +172,22 @@ Tray → **🧹 Downloads aufräumen …** (oder bei einer Ordner-Box: Rechtskli
 | Öffnen / ansehen | ↗ | Enter · ↑ |
 | Rückgängig | ↶ | Strg + Z · Rücktaste |
 
-- Gelöscht wird **erst bei „Fertig“** (oder beim Schließen) und nur in den **Papierkorb** – alles bleibt wiederherstellbar; bis dahin ist jede Entscheidung rückgängig zu machen.
+- Gelöscht wird **erst bei „Fertig“** (oder beim Wechsel auf eine andere Seite bzw. beim Schließen) und nur in den **Papierkorb** – alles bleibt wiederherstellbar; bis dahin ist jede Entscheidung rückgängig zu machen.
 - Behaltene Dateien werden beim nächsten Mal nicht erneut gezeigt (außer sie ändern sich). Schalter *Behaltene erneut zeigen* holt sie zurück.
 - Sortierung *Vorsortiert* (Standard), *Älteste zuerst* oder *Größte zuerst*; *Ordner …* räumt jeden anderen Ordner auf. Laufende Downloads (`.crdownload`) und geschützte Dateien werden übersprungen.
 - Einmal pro Woche erinnert ein Hinweis im Infobereich, wenn sich in Downloads viele alte Dateien angesammelt haben (Klick öffnet das Aufräumen; abschaltbar unter *Einstellungen*).
+
+## Seite „Speicher“ – die 20 größten Platzfresser je Laufwerk
+
+![Speicher – Top-Platzfresser](docs/speicher.png)
+
+Oben die Laufwerke als Karten (Belegung, frei, gesamt). Ein Klick analysiert das Laufwerk im Hintergrund (abbrechbar; beim ersten Mal je nach Größe ein bis wenige Minuten) und zeigt die **20 größten Platzfresser** als Balkendiagramm – nach Größe sortiert, Farbe = Art, mit Anteil an der Belegung:
+
+- **Sinnvolle Einheiten statt Sammelordner:** `Program Files`, `Users`, `AppData`, `steamapps/common`, `Epic Games`, `XboxGames` … werden aufgelöst, damit *World of Warcraft*, *Diablo IV* oder *Cyberpunk 2077* einzeln erscheinen. Ein Programm- oder Spielordner bleibt eine Einheit; liegt der Platz eines Ordners an einer Stelle (z. B. eine 30-GB-ISO in Downloads), wird diese gezeigt.
+- **Arten:** Spiel · Programm · System (Windows, Auslagerungsdatei, Ruhezustand, Wiederherstellungspunkte) · Benutzerordner · Ordner · Projekt · Video · Archiv/Installer · Temporär · Papierkorb.
+- **Recherche:** Programme und Ordner werden nachgeschlagen („World of Warcraft – MMORPG von Blizzard Entertainment“) und als *Spiel* erkannt, wenn die Quellen das sagen.
+- **Ehrliche Zahlen:** Junctions/Verknüpfungen werden nicht doppelt gezählt, OneDrive-Dateien „nur online“ belegen nichts (wird extra ausgewiesen), nicht lesbare Systembereiche erscheinen als „nicht erfasst“.
+- **Rechtsklick:** Im Explorer zeigen · Im Ordner-Assistenten öffnen · **Deinstallieren …** (öffnet *Apps & Features*) bei Programmen und Spielen · **Speicheroptimierung von Windows** bei System/Temporärem · **Papierkorb leeren** (mit Windows-Rückfrage) · **In den Papierkorb …** bei Dateien und Ordnern.
 
 ## Zuordnungslogik
 
@@ -209,6 +237,7 @@ Die **Recherche** (standardmäßig an, abschaltbar unter *🔎 Recherche ▾*) s
 - **Win + D-Festigkeit, Quick-Hide und Acrylic** nutzen Windows-Schnittstellen und sind in der Entwicklung nur ohne echten Windows-Desktop getestet. Falls „An den Desktop heften“ Probleme macht, im Tray unter *Einstellungen* abschalten.
 - **Automatisch einsortiert** werden nur Verknüpfungen (`.lnk`, `.url`), die eindeutig erkannt werden, und nur in bestehende Boxen.
 - Unter Windows 10 sind die Ecken der Boxen eckig (runde Fensterecken gibt es erst ab Windows 11).
+- **Speicher-Analyse:** Werte sind logische Dateigrößen. Der Ordner *Windows* enthält viele Hardlinks (WinSxS) und erscheint dadurch etwas größer, als er tatsächlich belegt; Ordner ohne Leserechte (z. B. *System Volume Information*) zählen als „nicht erfasst“. Netzlaufwerke werden nicht analysiert.
 - **Explorer-Rechtsklick:** Unter Windows 11 erscheint der Eintrag im klassischen Menü (*Weitere Optionen anzeigen* bzw. Umschalt + Rechtsklick); das neue Kurzmenü erlaubt Einträge nur für installierte App-Pakete.
 - **Ordner-Assistent:** Die Erkennung arbeitet mit Stichwörtern (DE/EN) im Dateinamen und Textanfang, ohne Texterkennung (OCR) – gescannte PDFs ohne Textebene werden nur über den Namen erkannt. Pro Analyse werden höchstens 60 000 Dateien betrachtet, Text ~25 s und Foto-Daten ~60 s lang gelesen; darüber hinaus zählt nur der Dateiname.
 - **Programmordner-Erkennung** ist eine Heuristik: Ein Programm ohne `.exe`/`.dll` in den ersten zwei Ebenen, das nicht in der Registry steht, gilt als Inhaltsordner – im Zweifel prüft die Recherche tiefer oder per Rechtsklick *Auf dem Desktop lassen*. Umgekehrt bleibt ein Inhaltsordner mit einzelner `.exe` lieber liegen.
@@ -221,7 +250,7 @@ Die Analyse-Engine liegt als einzelne, getestete Module in `dev/organizer/` und 
 
 ```powershell
 py dev/assemble.py        # Engine + Assistenten-Oberfläche in DesktopSorter.pyw einbauen
-py dev/run_tests.py       # 16 Engine-Testdateien + 2 Ende-zu-Ende-Tests (Hauptfenster, Assistent) + Prüfung, ob die .pyw aktuell ist
+py dev/run_tests.py       # 16 Engine-Testdateien + 3 Ende-zu-Ende-Tests (Desktop, Seiten, Assistent) + Prüfung, ob die .pyw aktuell ist
 ```
 
 ## Fehlerbehebung
