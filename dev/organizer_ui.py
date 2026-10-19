@@ -133,7 +133,7 @@ ORG_QUICK_FOLDERS = [("🖥", "Desktop", "desktop"), ("📄", "Dokumente", "docu
 def org_move_into(files: list, dest: Path) -> tuple:
     """Dateien in einen anderen Ordner legen (nie überschreiben). Protokoll im Format von
     org_undo, damit „Letzte Sortierung rückgängig“ auch das zurücknimmt.
-    → (Anzahl, Fehlermeldungen, Protokoll oder None bei verschiedenen Laufwerken)."""
+    → ([[alt, neu], …], Fehlermeldungen, Protokoll oder None bei verschiedenen Laufwerken)."""
     dest = Path(dest)
     moves, failed = [], []
     try:
@@ -142,7 +142,7 @@ def org_move_into(files: list, dest: Path) -> tuple:
     except ValueError:                                   # anderes Laufwerk
         root = None
     except OSError as e:
-        return 0, [f"{dest}: {e.strerror or e}"], None
+        return [], [f"{dest}: {e.strerror or e}"], None
     journal = None
     if root is not None:
         JOURNAL_DIR.mkdir(exist_ok=True)
@@ -168,7 +168,7 @@ def org_move_into(files: list, dest: Path) -> tuple:
         if journal:
             journal.write_text(json.dumps({"root": str(root), "created": [], "moves": moves},
                                           ensure_ascii=False, indent=1), encoding="utf-8")
-    return len(moves), failed, journal
+    return moves, failed, journal
 
 
 def org_research_dest(f, category: str) -> str:
@@ -191,7 +191,8 @@ class OrganizerView(QWidget):
         super().__init__(parent)
         self.mgr, self.folder = mgr, Path(folder)
         self.plan = None
-        self.boxes_fn = boxes_fn                       # → {Name: Ordner} der Desktop-Boxen
+        self.boxes_fn = boxes_fn                       # → Namen der Desktop-Boxen
+        self.box_move = None                           # fn(Dateien, Box) im Hauptfenster
         self.on_swipe = None                           # fn(Dateien, Titel, Plan) im Hauptfenster
         self.research: dict[str, dict] = {}           # Pfad → Ergebnis der Recherche
         self._research: ResearchJob | None = None
@@ -772,8 +773,8 @@ class OrganizerView(QWidget):
                                    "und kann nicht automatisch rückgängig gemacht werden.")) \
                 != QMessageBox.Yes:
             return
-        moved, failed, _journal = org_move_into(files, dest)
-        msg = f"{moved} Datei(en) verschoben nach {dest}."
+        moves, failed, _journal = org_move_into(files, dest)
+        msg = f"{len(moves)} Datei(en) verschoben nach {dest}."
         if failed:
             msg += "\n\nNicht verschoben:\n" + "\n".join(failed[:15])
         QMessageBox.information(self, "Verschieben", msg)
@@ -954,11 +955,11 @@ class OrganizerView(QWidget):
             target = org_known_folder(key)
             if os.path.normcase(str(target)) != os.path.normcase(str(self.folder)):
                 mm.addAction(f"{glyph}  {label}", lambda t=target: self.move_files(files, t))
-        boxes = self.boxes_fn() if self.boxes_fn else {}
-        if boxes:
+        boxes = self.boxes_fn() if self.boxes_fn else []
+        if boxes and self.box_move:
             bm = glass_menu(mm, "▣  Desktop-Box")
-            for name, folder in boxes.items():
-                bm.addAction(name, lambda d=folder: self.move_files(files, d))
+            for name in boxes:
+                bm.addAction(name, lambda n=name: self.box_move(files, n))
             mm.addMenu(bm)
         mm.addSeparator()
         mm.addAction("Anderer Ordner …", lambda: self._move_pick(files))

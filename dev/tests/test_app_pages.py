@@ -228,10 +228,18 @@ menu = org._move_menu(None, [movie])
 titles = [a.text() for a in menu.actions()]
 ok(any("Dokumente" in t for t in titles) and any("Anderer Ordner" in t for t in titles),
    f"Menü „Verschieben nach“: {titles}")
-(N / "Boxen" / "Spiele").mkdir(exist_ok=True)
+fm.store.add_box("Spiele")
 menu = org._move_menu(None, [movie])
 ok(any("Desktop-Box" in (a.menu().title() if a.menu() else "") for a in menu.actions()),
    "Desktop-Boxen als Ziel")
+g.MainWindow.confirm = lambda self, title, text: True
+save = touch(DL / "Savegame.sav", b"save")
+win.files_to_box([type("F", (), {"path": save})()], "Spiele")
+on_desk = N / "Desktop" / "Savegame.sav"
+ok(on_desk.exists() and not save.exists() and fm.store.box_of(on_desk) == "Spiele",
+   "In Desktop-Box legen: Datei kommt auf den Desktop und in die Box")
+wait(lambda: org.plan is not None and not (org._worker and org._worker.isRunning())
+     and org._research is None, 30)
 
 # ---------- Durchwischen: Seite statt Fenster ----------
 print("Aufräumen:")

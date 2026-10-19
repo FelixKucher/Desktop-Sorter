@@ -22,8 +22,24 @@ Die Datei **nicht auf den Desktop** legen, sonst sortiert sie sich selbst mit ei
 ## Ablauf
 
 1. **Zuordnen** im Hauptfenster: Gruppen erscheinen als Glaskarten, Unklares (orange **?**) ordnest du per Drag & Drop oder Rechtsklick zu. Deine **bestehenden Boxen** (▣) stehen immer als Karte bereit – auch leere –, sodass du jederzeit etwas hineinziehen kannst.
-2. **In Boxen sortieren**: Verknüpfungen, Dateien und Ordner wandern in `%USERPROFILE%\DesktopSorter Boxen\<Gruppe>`, und für jede Gruppe erscheint eine Glas-Box auf dem Desktop.
-3. Die App läuft danach im **Infobereich** (Tray) weiter und hält die Boxen auf dem Desktop. Sie trägt sich beim Start **automatisch in den Windows-Autostart** ein (startet dann nur Boxen + Tray, ohne Hauptfenster). Abschalten: *☰ Mehr* bzw. Tray → *Einstellungen* → *Mit Windows starten*.
+2. **In Boxen sortieren**: Für jede Gruppe erscheint eine Glas-Box auf dem Desktop. Die Verknüpfungen, Dateien und Ordner **bleiben dabei im Desktop-Ordner** – sie werden nur auf dem Desktop ausgeblendet und in ihrer Box gezeigt.
+3. Die App läuft danach im **Infobereich** (Tray) weiter und hält die Boxen auf dem Desktop. Sie startet **automatisch mit Windows** (nur Boxen + Tray, ohne Hauptfenster). Abschalten: *☰ Mehr* bzw. Tray → *Einstellungen* → *Mit Windows starten*.
+
+### Wenn Desktop Sorter nicht läuft
+
+…liegen alle Symbole **ganz normal auf dem Desktop** – so, als hätte es die Boxen nie gegeben:
+
+| Situation | Was passiert |
+|---|---|
+| App läuft | Einsortiertes ist auf dem Desktop ausgeblendet (Attribute *versteckt + System*, dadurch auch bei „Ausgeblendete Elemente anzeigen“ unsichtbar) und erscheint in seiner Box |
+| **Beenden** (Tray → *Beenden*, *☰ Mehr* → *Beenden*) | alle Symbole werden sofort wieder eingeblendet |
+| **Abmelden / Herunterfahren** | ebenso (wird das Abmelden abgebrochen, blendet die App nach einer Minute wieder aus) |
+| **Absturz / im Task-Manager beendet** | beim nächsten Anmelden blendet ein einmaliger Windows-Eintrag (*RunOnce*) alles wieder ein; startet die App, übernimmt sie wieder. Sofort von Hand: `%USERPROFILE%\.desktop_sorter\Desktop-Symbole wiederherstellen.cmd` doppelklicken |
+| Nächster Start | die Boxen werden aus der gespeicherten Zuordnung wiederhergestellt |
+
+Da nichts mehr verschoben wird, bleiben Pfade, Verknüpfungen auf diese Dateien und die OneDrive-Sicherung des Desktops unverändert. Boxen aus früheren Versionen (Inhalt in `%USERPROFILE%\DesktopSorter Boxen\<Box>`) werden beim ersten Start automatisch zurück auf den Desktop gelegt und zugeordnet.
+
+**Autostart:** Eintrag *Desktop Sorter* unter `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (ohne Adminrechte; sichtbar im Task-Manager unter *Autostart-Apps*). Er wird bei jedem Start aktualisiert und zeigt so immer auf die aktuelle `.pyw` und das verwendete Python (`pythonw.exe`, kein Konsolenfenster). Solange in der App *Mit Windows starten* an ist, wird eine Sperre im Task-Manager wieder aufgehoben – abschalten also in der App. Die frühere Verknüpfung im Autostart-Ordner wird entfernt.
 
 ## Das Hauptfenster
 
@@ -55,7 +71,7 @@ Auf der Seite **Desktop** sind alle Funktionen von hier aus erreichbar:
 | orange **?** | unklar – Vorschlag per Doppelklick übernehmen |
 | lila/türkis **⚙** | Programm- bzw. Projektordner – bleibt liegen |
 
-Ein Klick auf eine Box-Karte zeigt unten ihren Inhalt: neue Objekte zum Verschieben, darunter blass, was schon in der Box liegt (Doppelklick öffnet, Rechtsklick: *Zurück auf den Desktop*, *In den Papierkorb*). Rechtsklick auf eine Box-Karte: *Box-Ordner öffnen*, *Box umbenennen*, *Box auflösen*.
+Ein Klick auf eine Box-Karte zeigt unten ihren Inhalt: neue Objekte zum Verschieben, darunter blass, was schon in der Box liegt (Doppelklick öffnet, Rechtsklick: *Zurück auf den Desktop*, *In den Papierkorb*). Rechtsklick auf eine Box-Karte: *Box umbenennen*, *Box auflösen* (alles wieder normal auf den Desktop).
 
 **Unterordner** werden mit einsortiert (*Ordner einbeziehen*, Standard an) – aber nur, wenn es Inhaltsordner sind (Fotos, Dokumente, Musik …). **Programm-, Spiel- und Projektordner bleiben liegen**, damit sie weiter funktionieren:
 
@@ -101,11 +117,11 @@ Google bietet für solche Abfragen keine freie Schnittstelle; Wikidata ist die o
 | Größe ändern | rechte untere Ecke ziehen |
 | Ein-/Ausklappen | Doppelklick auf die Titelleiste |
 | Zwischen Boxen verschieben | Symbol in eine andere Box ziehen · Rechtsklick → *Verschieben in* |
-| Zurück auf den Desktop | Symbol auf den Desktop ziehen · Rechtsklick → *Zurück auf den Desktop* |
-| Neues in eine Box legen | Datei vom Desktop/Explorer auf die Box ziehen |
+| Zurück auf den Desktop | Symbol auf eine freie Desktopfläche ziehen · Rechtsklick → *Auf den Desktop legen* |
+| Neues in eine Box legen | Datei vom Desktop oder aus dem Explorer auf die Box ziehen (aus anderen Ordnern wird sie dabei auf den Desktop verschoben) |
 | Rechtsklick auf Titelleiste | Darstellung · Umbenennen · Ordner öffnen · Neue Box · Neue Ordner-Box · Auflösen |
 
-Position, Größe, Einklapp-Zustand und Darstellung jeder Box werden gespeichert. Die Boxen spiegeln den Inhalt ihrer Ordner live – was du im Explorer in `DesktopSorter Boxen\<Gruppe>` legst, erscheint sofort in der Box.
+Position, Größe, Einklapp-Zustand, Darstellung und Inhalt jeder Box werden gespeichert. Löschst oder benennst du ein eingeordnetes Objekt um, folgt die Box automatisch.
 
 ## Fences-Funktionen
 
@@ -214,7 +230,8 @@ Erfasst werden beide Desktop-Quellen, die Windows gemeinsam anzeigt: der eigene 
 | `DesktopSorter.pyw` | die komplette Anwendung |
 | `regeln.toml` | eigene Themen; wird beim ersten Start angelegt und ist frei editierbar |
 | `entscheidungen.json` | deine Zuordnungen und gelernten Stichwörter (persönlich, nicht im Repo) |
-| `%USERPROFILE%\DesktopSorter Boxen\` | Inhalt der Boxen (ein Unterordner je Box) + `.boxen.json` (Positionen) |
+| `%USERPROFILE%\DesktopSorter Boxen\.boxen.json` | Boxen: Inhalt (Zuordnung), Positionen, Darstellung, Einstellungen |
+| `%USERPROFILE%\.desktop_sorter\Desktop-Symbole wiederherstellen.cmd` | Notfall: blendet alle Box-Symbole wieder ein (existiert nur, solange etwas ausgeblendet ist) |
 | `%USERPROFILE%\.desktop_sorter\` | Journale für „Rückgängig“ (Boxen und Ordner-Assistent) · `recherche_cache.json` (Recherche-Ergebnisse, 90 Tage) |
 | `dev/` | Quellcode der Analyse-Engine (`dev/organizer/org_*.py`), Assistenten-Oberfläche, Tests und Build-Skript – nur für die Entwicklung nötig |
 
@@ -237,6 +254,7 @@ Die **Recherche** (standardmäßig an, abschaltbar unter *🔎 Recherche ▾*) s
 - **Win + D-Festigkeit, Quick-Hide und Acrylic** nutzen Windows-Schnittstellen und sind in der Entwicklung nur ohne echten Windows-Desktop getestet. Falls „An den Desktop heften“ Probleme macht, im Tray unter *Einstellungen* abschalten.
 - **Automatisch einsortiert** werden nur Verknüpfungen (`.lnk`, `.url`), die eindeutig erkannt werden, und nur in bestehende Boxen.
 - Unter Windows 10 sind die Ecken der Boxen eckig (runde Fensterecken gibt es erst ab Windows 11).
+- **Ausblenden statt Verschieben:** Während die App läuft, sind Box-Symbole versteckte Systemdateien. Ein Programm, das *genau dann* seine Desktop-Verknüpfung neu schreibt (manche Updater), kann daran scheitern – dann bleibt die alte Verknüpfung. Wer im Explorer „Geschützte Systemdateien ausblenden“ abgeschaltet hat, sieht Box-Symbole zusätzlich blass auf dem Desktop. Verknüpfungen auf dem öffentlichen Desktop lassen sich nur mit Administratorrechten einsortieren.
 - **Speicher-Analyse:** Werte sind logische Dateigrößen. Der Ordner *Windows* enthält viele Hardlinks (WinSxS) und erscheint dadurch etwas größer, als er tatsächlich belegt; Ordner ohne Leserechte (z. B. *System Volume Information*) zählen als „nicht erfasst“. Netzlaufwerke werden nicht analysiert.
 - **Explorer-Rechtsklick:** Unter Windows 11 erscheint der Eintrag im klassischen Menü (*Weitere Optionen anzeigen* bzw. Umschalt + Rechtsklick); das neue Kurzmenü erlaubt Einträge nur für installierte App-Pakete.
 - **Ordner-Assistent:** Die Erkennung arbeitet mit Stichwörtern (DE/EN) im Dateinamen und Textanfang, ohne Texterkennung (OCR) – gescannte PDFs ohne Textebene werden nur über den Namen erkannt. Pro Analyse werden höchstens 60 000 Dateien betrachtet, Text ~25 s und Foto-Daten ~60 s lang gelesen; darüber hinaus zählt nur der Dateiname.
@@ -258,5 +276,7 @@ py dev/run_tests.py       # 16 Engine-Testdateien + 3 Ende-zu-Ende-Tests (Deskto
 - **„no Qt platform plugin could be initialized“:** `python -m pip install --force-reinstall PySide6 PySide6_Essentials PySide6_Addons shiboken6` in der Umgebung ausführen, mit der du startest.
 - **Schwarzer statt durchsichtiger Hintergrund:** In `DesktopSorter.pyw` `ACRYLIC = False` (Hauptfenster) bzw. `Win32.ok = False` (Boxen) setzen.
 - **Transparenz anpassen:** Boxen per Rechtsklick → Darstellung → Deckkraft; Hauptfenster über `ACRYLIC_TINT` (letzte zwei Hex-Stellen = Deckkraft).
-- **Verknüpfungen vom öffentlichen Desktop lassen sich nicht verschieben:** als Administrator starten oder den Schalter „Öffentlicher Desktop“ ausschalten.
+- **Symbole fehlen auf dem Desktop, obwohl Desktop Sorter nicht läuft:** `%USERPROFILE%\.desktop_sorter\Desktop-Symbole wiederherstellen.cmd` doppelklicken (oder `py DesktopSorter.pyw --restore`).
+- **Startet nicht mit Windows:** Task-Manager → *Autostart-Apps* → *Desktop Sorter* aktivieren, oder in der App *Mit Windows starten* aus- und wieder einschalten.
+- **Verknüpfungen vom öffentlichen Desktop lassen sich nicht einsortieren:** als Administrator starten oder den Schalter „Öffentlicher Desktop“ ausschalten.
 - **Doppelklick öffnet einen Editor:** Rechtsklick → Öffnen mit → `pythonw.exe` → „Immer diese App verwenden“.

@@ -110,10 +110,12 @@ touch(D / "Rechnung_2024_03.pdf")
 touch(D / "Notizen.txt")
 touch(D / "Müll.txt")
 touch(D / "Lebenslauf Felix.pdf")
-# Bestehende Boxen: „Spiele“ mit Inhalt, „Kommunikation“ mit Inhalt, „Werkzeuge“ leer
+# Bestehende Boxen im Format früherer Versionen (Inhalt in Box-Ordnern) – werden beim Start
+# zurück auf den Desktop gelegt und zugeordnet: „Spiele“, „Kommunikation“ mit Inhalt, „Werkzeuge“ leer
 touch(S / "Spiele" / "Elden Ring.lnk")
 touch(S / "Kommunikation" / "Teams.lnk")
 (S / "Werkzeuge").mkdir()
+g.desktop_dirs = lambda: (D, Path("/nonexistent"))
 
 # ---------- Engine: Unterordner ----------
 print("Unterordner erkennen:")
@@ -208,6 +210,10 @@ g._online_fetch = fake_fetch
 print("Hauptfenster:")
 fm = g.FenceManager(S)
 fm.sync()
+box_of = fm.store.box_of
+ok((D / "Elden Ring.lnk").exists() and box_of(D / "Elden Ring.lnk") == "Spiele"
+   and not (S / "Spiele").exists() and "Werkzeuge" in fm.store.names(),
+   "Alte Box-Ordner: Inhalt zurück auf dem Desktop und der Box zugeordnet")
 args = argparse.Namespace(desktop=D, rules=None, memory=N / "mem.json", min_group=2, storage=S)
 CONFIRMS, MESSAGES = [], []
 ANSWERS = []
@@ -390,12 +396,12 @@ ok(True, "Menüs „Recherche“, „Mehr“ und „Ordner-Assistent“ öffnen 
 g.ask_box_name = lambda title, text: "Games"
 win.select_group("Spiele")
 win.rename_box("Spiele")
-ok((S / "Games" / "Elden Ring.lnk").exists() and item("Hollow Knight").category == "Games",
-   "Box umbenennen: Ordner und Zuordnungen folgen")
+ok(box_of(D / "Elden Ring.lnk") == "Games" and item("Hollow Knight").category == "Games",
+   "Box umbenennen: Inhalt und Zuordnungen folgen")
 ok(win.selected == "Games", "Auswahl folgt der Umbenennung")
 g.ask_box_name = lambda title, text: "Neu Leer"
 win.new_box()
-ok((S / "Neu Leer").is_dir() and any(c.name == "Neu Leer" for c in win.grid.cards),
+ok("Neu Leer" in fm.store.names() and any(c.name == "Neu Leer" for c in win.grid.cards),
    "Neue Box erscheint sofort als Karte")
 
 if os.environ.get("DS_SHOT"):
@@ -416,18 +422,25 @@ ok(wait(lambda: CONFIRMS and settled(), 60), "Danach automatisch sortiert")
 SLOW["s"] = 0.0
 ok(CONFIRMS and "Geprüft mit Wikidata, Wikipedia, Flathub, Chocolatey" in CONFIRMS[0][1],
    "Bestätigung nennt das Prüfergebnis")
-ok((S / "Games" / "Hollow Knight.url").exists(), "Hollow Knight in Box „Games“")
-ok((S / "Games" / "Stardew Valley").is_dir(), "Stardew Valley (recherchiert) in „Games“ (umbenannte Box)")
-ok((S / "Kommunikation" / "Discord.lnk").exists(), "Discord in Box „Kommunikation“")
-ok((S / "Bilder & Grafik" / "Urlaub Kroatien").is_dir(), "Fotoordner in „Bilder & Grafik“")
-ok((S / "Werkzeuge" / "Notizen.txt").exists(), "Notizen in leerer Box „Werkzeuge“")
-ok((D / "Origin Notes.lnk").exists(), "Widerspruch bleibt zur Prüfung auf dem Desktop")
+ok(box_of(D / "Hollow Knight.url") == "Games", "Hollow Knight in Box „Games“")
+ok(box_of(D / "Stardew Valley") == "Games", "Stardew Valley (recherchiert) in „Games“ (umbenannte Box)")
+ok(box_of(D / "Discord.lnk") == "Kommunikation", "Discord in Box „Kommunikation“")
+ok(box_of(D / "Urlaub Kroatien") == "Bilder & Grafik", "Fotoordner in „Bilder & Grafik“")
+ok(box_of(D / "Notizen.txt") == "Werkzeuge", "Notizen in leerer Box „Werkzeuge“")
+ok(all((D / n).exists() for n in ("Hollow Knight.url", "Stardew Valley", "Discord.lnk",
+                                   "Urlaub Kroatien", "Notizen.txt")),
+   "Alle einsortierten Dateien liegen weiterhin im Desktop-Ordner")
+ok(not list(S.glob("*/")) or all(d.name.startswith(".") for d in S.iterdir() if d.is_dir()),
+   "Keine Box-Ordner mehr – nichts wird vom Desktop weggeschoben")
+ok(box_of(D / "Origin Notes.lnk") is None, "Widerspruch bleibt zur Prüfung auf dem Desktop")
 for n in ("Diablo III", "Arduino IDE", "Arduino Sketche", "Visual Studio", "Python Tool", "Factorio"):
-    ok((D / n).is_dir(), f"{n} liegt noch auf dem Desktop")
-wait(settled)
+    ok(box_of(D / n) is None, f"{n} bleibt frei auf dem Desktop")
+ok(wait(lambda: settled() and all(i.label != "Hollow Knight" for i in win.items), 10),
+   "Neu-Scan: Einsortiertes gilt nicht mehr als „auf dem Desktop“")
 ANSWERS[:] = [True]
 win.undo()
-ok((D / "Hollow Knight.url").exists() and (D / "Urlaub Kroatien").is_dir(), "Rückgängig")
+ok(box_of(D / "Hollow Knight.url") is None and box_of(D / "Urlaub Kroatien") is None
+   and box_of(D / "Elden Ring.lnk") == "Games", "Rückgängig: nur die Sortierung wird zurückgenommen")
 wait(settled)
 
 # ---------- Automatisch einsortieren prüft mit ----------
@@ -439,9 +452,10 @@ touch(D / "Discord PTB.lnk")
 WD["discord ptb"] = WD["discord"]
 FLATHUB["discord ptb"] = FLATHUB["discord"]
 fm._autosort()
-ok(wait(lambda: not (fm._worker and fm._worker.isRunning()) and not (D / "Discord PTB.lnk").exists(), 15),
+ok(wait(lambda: not (fm._worker and fm._worker.isRunning())
+        and box_of(D / "Discord PTB.lnk") == "Kommunikation", 15),
    "Neue Verknüpfung: geprüft und in „Kommunikation“ einsortiert")
-ok((D / "Origin Notes Kopie.lnk").exists(), "Neue Verknüpfung mit Widerspruch bleibt liegen")
+ok(box_of(D / "Origin Notes Kopie.lnk") is None, "Neue Verknüpfung mit Widerspruch bleibt liegen")
 
 win.close()
 fails = RESULTS.count(False)

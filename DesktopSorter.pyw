@@ -24,8 +24,10 @@ Bedienung
   • Recherche: Jede Zuordnung wird in offenen Quellen gegengeprüft (Wikidata,
     Wikipedia, Flathub, Chocolatey) – bei jedem Scan und vor dem Sortieren.
     Widersprüche bleiben als „?“ zur Entscheidung liegen.
-  • „In Boxen sortieren“ verschiebt erst nach Bestätigung; „Rückgängig“ macht es
-    komplett rückgängig.
+  • „In Boxen sortieren“ ordnet erst nach Bestätigung zu; „Rückgängig“ macht es
+    komplett rückgängig. Die Dateien bleiben im Desktop-Ordner: Solange die App läuft,
+    erscheinen sie nur in ihrer Box – läuft sie nicht, liegen sie ganz normal auf dem
+    Desktop. Die App startet automatisch mit Windows.
   • Die Leiste darunter erreicht alles Weitere: Ordner-Assistent, Downloads
     aufräumen, Papierkorb, neue Box, Boxen anordnen/ausblenden, Einstellungen.
 """
@@ -57,7 +59,7 @@ except ModuleNotFoundError:
         tomllib = None      # → eingebauter Leser für regeln.toml
 
 JOURNAL_DIR = Path.home() / ".desktop_sorter"
-STORAGE_DIR = Path.home() / "DesktopSorter Boxen"   # Inhalt der Glas-Boxen
+STORAGE_DIR = Path.home() / "DesktopSorter Boxen"   # Einstellungen der Glas-Boxen (.boxen.json)
 DEFAULT_RULES = Path(__file__).with_name("regeln.toml")
 DEFAULT_RULES_TEXT = """# Eigene Themen — haben Vorrang vor allen eingebauten Regeln.
 # Schlüssel = Ordnername, Werte = Regex-Fragmente (Groß/Klein egal) auf den Anzeigenamen.
@@ -1456,31 +1458,6 @@ def unique_dest(folder: Path, name: str) -> Path:
     return dest
 
 
-def apply(target: Path, groups) -> tuple[Path, list[str]]:
-    """Verschiebt jede Gruppe nach target/<Gruppe> (Box-Speicher oder Desktop)."""
-    JOURNAL_DIR.mkdir(exist_ok=True)
-    target.mkdir(parents=True, exist_ok=True)
-    journal = JOURNAL_DIR / f"journal-{time.strftime('%Y%m%d-%H%M%S')}.json"
-    moves, created, denied = [], [], []
-    try:
-        for cat, its in groups.items():
-            folder = target / cat
-            if not folder.exists():
-                folder.mkdir()
-                created.append(str(folder))
-            for it in its:
-                dest = unique_dest(folder, it.path.name)
-                try:
-                    shutil.move(str(it.path), str(dest))
-                    moves.append([str(it.path), str(dest)])
-                except PermissionError:
-                    denied.append(it.label)
-    finally:  # Journal immer schreiben, damit --undo auch nach Abbruch greift
-        journal.write_text(json.dumps({"moves": moves, "created": created},
-                                      indent=2, ensure_ascii=False), encoding="utf-8")
-    return journal, denied
-
-
 def _find_moved(dest: Path) -> Path | None:
     """Datei, die nach dem Sortieren in eine andere Box gezogen wurde, wiederfinden."""
     root = dest.parent.parent
@@ -1509,6 +1486,304 @@ def undo(arg: str) -> None:
             shutil.rmtree(f)
     js[-1].rename(js[-1].with_suffix(".undone.json"))
     print(f"Rückgängig gemacht: {len(data['moves'])} Objekte.")
+
+
+# --------------------------------------------------------------------------- #
+# Boxen-Zuordnung: Dateien bleiben auf dem Desktop
+# --------------------------------------------------------------------------- #
+# Einsortierte Symbole bleiben im Desktop-Ordner liegen (auch OneDrive-sicher). Solange die
+# App läuft, sind sie auf dem Desktop ausgeblendet (Attribute „versteckt“ + „System“ – damit
+# bleiben sie auch bei „Ausgeblendete Elemente anzeigen“ unsichtbar) und erscheinen nur in
+# ihrer Box. Beim Beenden, Abmelden oder Herunterfahren werden sie wieder eingeblendet;
+# nach einem Absturz erledigt das der nächste Start bzw. die Notfall-Datei.
+BOX_ATTRS = 0x2 | 0x4                       # FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
+BOX_ATTR_SUPPORT = os.name == "nt"          # sonst (Tests unter Linux) nur Buchführung
+RESTORE_RUNONCE = "DesktopSorter-Wiederherstellen"
+AUTOSTART_NAME = "Desktop Sorter"
+
+
+def app_pythonw() -> Path:
+    """Interpreter ohne Konsolenfenster (pythonw.exe neben python.exe, auch in venvs)."""
+    exe = Path(sys.executable)
+    w = exe.with_name("pythonw.exe")
+    return w if w.exists() else exe
+
+
+def app_command(*args: str) -> str:
+    return " ".join([f'"{app_pythonw()}"', f'"{Path(__file__).resolve()}"'] + list(args))
+
+
+def restore_script_path() -> Path:
+    return JOURNAL_DIR / "Desktop-Symbole wiederherstellen.cmd"
+
+
+def _get_attrs(path) -> int | None:
+    if os.name != "nt":
+        return None
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    k32.GetFileAttributesW.restype = ctypes.c_uint32     # sonst -1 statt 0xFFFFFFFF
+    k32.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
+    a = k32.GetFileAttributesW(str(path))
+    return None if a == 0xFFFFFFFF else int(a)
+
+
+def _set_attrs(path, attrs: int) -> bool:
+    if os.name != "nt":
+        return True
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    k32.SetFileAttributesW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+    attrs &= 0xFFFFFFFF
+    if attrs & ~0x80:                      # FILE_ATTRIBUTE_NORMAL gilt nur allein
+        attrs &= ~0x80
+    return bool(k32.SetFileAttributesW(str(path), attrs or 0x80))
+
+
+def shell_changed(paths) -> None:
+    """Explorer sofort neu zeichnen lassen (sonst erscheint/verschwindet es erst später)."""
+    if os.name != "nt" or not paths:
+        return
+    import ctypes
+    sh = ctypes.windll.shell32
+    sh.SHChangeNotify.argtypes = [ctypes.c_long, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
+    parents = set()
+    for p in paths:
+        sh.SHChangeNotify(0x2000, 0x0005, ctypes.c_wchar_p(str(p)), None)   # UPDATEITEM
+        parents.add(str(Path(p).parent))
+    for d in parents:
+        sh.SHChangeNotify(0x1000, 0x0005, ctypes.c_wchar_p(d), None)        # UPDATEDIR
+
+
+def _runonce(value: str | None) -> None:
+    """Sicherheitsnetz für Abstürze: beim nächsten Anmelden einblenden (läuft die App
+    dann schon, tut der Aufruf nichts)."""
+    if os.name != "nt":
+        return
+    import winreg
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                              r"Software\Microsoft\Windows\CurrentVersion\RunOnce") as k:
+            if value:
+                winreg.SetValueEx(k, RESTORE_RUNONCE, 0, winreg.REG_SZ, value)
+            else:
+                try:
+                    winreg.DeleteValue(k, RESTORE_RUNONCE)
+                except FileNotFoundError:
+                    pass
+    except OSError:
+        pass
+
+
+class BoxStore:
+    """Welche Desktop-Objekte in welcher Box liegen – gespeichert in der Box-Konfiguration:
+    cfg["boxes"][Name]["items"] = Pfade, cfg["hidden"] = von uns ausgeblendet
+    (Pfad → ursprüngliche Attribute)."""
+
+    def __init__(self, cfg: dict, save=lambda: None):
+        self.cfg, self.save = cfg, save
+        cfg.setdefault("boxes", {})
+        cfg.setdefault("hidden", {})
+        self.active = True               # False → nichts ausblenden (z. B. beim Beenden)
+
+    # ----- Boxen -----
+    def names(self) -> list[str]:
+        return sorted((n for n, b in self.cfg["boxes"].items() if not b.get("portal")),
+                      key=str.lower)
+
+    def add_box(self, name: str) -> None:
+        box = self.cfg["boxes"].setdefault(name, {})
+        box.pop("portal", None)
+        box.setdefault("items", [])
+        self.save()
+
+    def rename_box(self, old: str, new: str) -> None:
+        boxes = self.cfg["boxes"]
+        boxes[new] = boxes.pop(old, {})
+        self.save()
+
+    def remove_box(self, name: str) -> list[Path]:
+        """Box entfernen; ihre Objekte erscheinen wieder auf dem Desktop."""
+        items = self.items(name)
+        box = self.cfg["boxes"].pop(name, {})
+        self._unhide([Path(p) for p in box.get("items", [])])
+        self._commit()
+        return items
+
+    # ----- Objekte -----
+    def items(self, name: str) -> list[Path]:
+        box = self.cfg["boxes"].get(name) or {}
+        return [Path(p) for p in box.get("items", []) if os.path.lexists(p)]
+
+    def all_items(self) -> dict[str, str]:
+        return {p: n for n, b in self.cfg["boxes"].items() if not b.get("portal")
+                for p in b.get("items", [])}
+
+    def box_of(self, path) -> str | None:
+        return self.all_items().get(str(path))
+
+    def assign(self, paths, name: str) -> list[str]:
+        """Objekte (auf dem Desktop) in eine Box legen. → Namen, die nicht gingen."""
+        self.cfg["boxes"].setdefault(name, {}).setdefault("items", [])
+        failed, changed = [], []
+        for p in map(Path, paths):
+            key = str(p)
+            if not os.path.lexists(p):
+                continue
+            if self.active and not self._hide(p):
+                failed.append(p.name)
+                continue
+            for n, b in self.cfg["boxes"].items():
+                if n != name and key in b.get("items", []):
+                    b["items"].remove(key)
+            items = self.cfg["boxes"][name]["items"]
+            if key not in items:
+                items.append(key)
+            changed.append(p)
+        self._commit()
+        shell_changed(changed)
+        return failed
+
+    def release(self, paths) -> None:
+        """Aus der Box nehmen – das Symbol liegt wieder sichtbar auf dem Desktop."""
+        keys = {str(p) for p in paths}
+        for b in self.cfg["boxes"].values():
+            if "items" in b:
+                b["items"] = [p for p in b["items"] if p not in keys]
+        self._unhide([Path(k) for k in keys])
+        self._commit()
+
+    def prune(self) -> bool:
+        """Gelöschte/umbenannte Objekte vergessen. → True, wenn sich etwas geändert hat."""
+        changed = False
+        for b in self.cfg["boxes"].values():
+            if "items" in b:
+                keep = [p for p in b["items"] if os.path.lexists(p)]
+                changed |= len(keep) != len(b["items"])
+                b["items"] = keep
+        for k in [k for k in self.cfg["hidden"] if not os.path.lexists(k)]:
+            del self.cfg["hidden"][k]
+            changed = True
+        if changed:
+            self._commit()
+        return changed
+
+    # ----- Ausblenden / Einblenden -----
+    def _hide(self, p: Path) -> bool:
+        key = str(p)
+        cur = _get_attrs(p)
+        if key in self.cfg["hidden"]:                    # schon von uns ausgeblendet
+            return cur is None or (cur & BOX_ATTRS) == BOX_ATTRS or _set_attrs(p, cur | BOX_ATTRS)
+        if BOX_ATTR_SUPPORT:
+            if cur is None or not _set_attrs(p, cur | BOX_ATTRS):
+                return False                             # z. B. öffentlicher Desktop ohne Adminrechte
+        self.cfg["hidden"][key] = cur if cur is not None else 0
+        return True
+
+    def _unhide(self, paths) -> None:
+        done = []
+        for p in map(Path, paths):
+            orig = self.cfg["hidden"].pop(str(p), None)
+            if orig is None:
+                continue
+            cur = _get_attrs(p)
+            if cur is not None:
+                _set_attrs(p, (cur & ~BOX_ATTRS) | (int(orig) & BOX_ATTRS))
+            done.append(p)
+        shell_changed(done)
+
+    def hide_all(self) -> list[str]:
+        """Alle einsortierten Objekte ausblenden (Programmstart). → Fehlschläge."""
+        self.active = True
+        paths = [Path(p) for p in self.all_items() if os.path.lexists(p)]
+        failed = [p.name for p in paths if not self._hide(p)]
+        self._commit()
+        shell_changed(paths)
+        return failed
+
+    def show_all(self) -> int:
+        """Alles wieder sichtbar auf den Desktop (Beenden, Abmelden, Absturz-Rettung)."""
+        self.active = False
+        n = len(self.cfg["hidden"])
+        self._unhide(list(self.cfg["hidden"]))
+        self._commit()
+        return n
+
+    def _commit(self) -> None:
+        """Speichern und die Notfall-Rettung aktuell halten (Datei + RunOnce)."""
+        self.save()
+        hidden = list(self.cfg["hidden"])
+        try:
+            script = restore_script_path()
+            if hidden:
+                script.parent.mkdir(parents=True, exist_ok=True)
+                lines = ["@echo off", "rem Blendet die von Desktop Sorter ausgeblendeten "
+                         "Desktop-Symbole wieder ein.", "chcp 65001 >nul"]
+                lines += [f'attrib -h -s "{p}"' for p in hidden]
+                script.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+            elif script.exists():
+                script.unlink()
+        except OSError:
+            pass
+        _runonce(app_command("--restore") if hidden else None)
+
+
+def migrate_box_folders(storage: Path, store: BoxStore, desktop: Path) -> list[str]:
+    """Frühere Versionen haben Box-Inhalte nach storage/<Box> verschoben. Zurück auf den
+    Desktop legen und der Box zuordnen. → Fehlermeldungen."""
+    failed = []
+    if not storage.is_dir() or not desktop.is_dir():
+        return failed
+    for d in sorted(storage.iterdir()):
+        if not d.is_dir() or d.name.startswith("."):
+            continue
+        store.add_box(d.name)
+        moved = []
+        for p in sorted(d.iterdir()):
+            if p.name.lower() == "desktop.ini":
+                continue
+            target = unique_dest(desktop, p.name)
+            try:
+                shutil.move(str(p), str(target))
+                moved.append(target)
+            except OSError as e:
+                failed.append(f"{p.name}: {e.strerror or e}")
+        failed += store.assign(moved, d.name)
+        try:
+            if not any(x.name.lower() != "desktop.ini" for x in d.iterdir()):
+                shutil.rmtree(d)
+        except OSError:
+            pass
+    return failed
+
+
+def boxes_journal(changes: dict) -> Path:
+    """Protokoll fürs Rückgängigmachen: Pfad → vorherige Box (None = lag frei)."""
+    JOURNAL_DIR.mkdir(exist_ok=True)
+    journal = JOURNAL_DIR / f"journal-{time.strftime('%Y%m%d-%H%M%S')}.json"
+    n = 1
+    while journal.exists():
+        n += 1
+        journal = JOURNAL_DIR / f"journal-{time.strftime('%Y%m%d-%H%M%S')}-{n}.json"
+    journal.write_text(json.dumps({"assign": changes}, indent=2, ensure_ascii=False),
+                       encoding="utf-8")
+    return journal
+
+
+def boxes_undo(journal: Path, store: BoxStore) -> int:
+    """Einsortieren rückgängig: vorherige Zuordnung wiederherstellen."""
+    data = json.loads(journal.read_text(encoding="utf-8"))
+    n = 0
+    for path, before in reversed(list(data.get("assign", {}).items())):
+        if not os.path.lexists(path):
+            continue
+        if before:
+            store.assign([path], before)
+        else:
+            store.release([path])
+        n += 1
+    journal.rename(journal.with_suffix(".undone.json"))
+    return n
 
 
 # ===========================================================================
@@ -10105,6 +10380,11 @@ class MainWindow(_Base):
         self.args = args
         self.fences = fences
         self.mgr = fences or LocalCfg()  # Einstellungen für Seiten (ohne Boxen: nur Sitzung)
+        # Box-Zuordnung (Objekte bleiben auf dem Desktop). Ohne Boxen-Verwaltung (Testansicht)
+        # wird nichts ausgeblendet.
+        self.boxes = fences.store if fences else BoxStore(self.mgr.cfg, self.mgr.write_cfg)
+        if not fences:
+            self.boxes.active = False
         self.keep_running = False       # True → Schließen versteckt nur (Infobereich)
         self.memory = Memory(args.memory)
         self.toml_rules = load_rules(args.rules)
@@ -10309,8 +10589,9 @@ class MainWindow(_Base):
 
         # ----- Seiten „Ordner“, „Aufräumen“, „Speicher“ (keine eigenen Fenster) -----
         self.organizer = OrganizerView(self.mgr, downloads_dir(), autostart=False,
-                                       boxes_fn=self.box_dirs)
+                                       boxes_fn=self.box_names)
         self.organizer.on_swipe = self.start_swipe
+        self.organizer.box_move = self.files_to_box
         self.cleaner = CleanerView(self.mgr, downloads_dir(), autoload=False)
         self.storage = StorageView(self.mgr, on_open_folder=lambda p: self.show_page("folders", p))
         for w in (self.organizer, self.cleaner, self.storage):
@@ -10382,26 +10663,15 @@ class MainWindow(_Base):
         if self.isVisible() and self.items and not busy:
             self.refresh()
 
-    def box_dirs(self) -> dict[str, Path]:
-        """Bestehende Glas-Boxen (Ordner im Box-Speicher) – immer als Ziel verfügbar."""
-        if self.fences:
-            return self.fences.group_dirs()
-        try:
-            return {d.name: d for d in sorted(self.args.storage.iterdir())
-                    if d.is_dir() and not d.name.startswith(".")}
-        except OSError:
-            return {}
+    def box_names(self) -> list[str]:
+        """Bestehende Glas-Boxen – immer als Ziel verfügbar."""
+        return self.boxes.names()
 
-    @staticmethod
-    def box_entries(folder: Path) -> list[Path]:
-        try:
-            return sorted((p for p in folder.iterdir() if p.name.lower() != "desktop.ini"
-                           and not p.name.startswith(".")), key=lambda p: p.name.lower())
-        except OSError:
-            return []
+    def box_items(self, name: str) -> list[Path]:
+        return sorted(self.boxes.items(name), key=lambda p: display_name(p).lower())
 
     def known_groups(self, groups=None) -> list[str]:
-        names = list(self.box_dirs())                # bestehende Boxen zuerst
+        names = list(self.box_names())               # bestehende Boxen zuerst
         names += list(groups or []) + [c for c in CATEGORIES if c != "Sonstiges"]
         names += [c for c, _ in self.toml_rules] + self.memory.groups
         return list(dict.fromkeys(names))
@@ -10413,7 +10683,7 @@ class MainWindow(_Base):
         pool = [it for it in self.items if it.kind != "folder" or inc]
         sure = [it for it in pool if it.confidence != "low"]
         groups, left = plan(sure, self.args.min_group, inc)
-        boxes = self.box_dirs()
+        boxes = set(self.box_names())
         for it in [i for i in left if i.category in boxes and i.confidence != "keep"]:
             groups.setdefault(it.category, []).append(it)
             left.remove(it)
@@ -10459,6 +10729,8 @@ class MainWindow(_Base):
             rules = self.toml_rules + self.memory.rules()
             skip = set(CATEGORIES) | {c for c, _ in rules} | set(self.memory.groups)
             items = scan(user, public, skip)
+            boxed = set(self.boxes.all_items())          # schon in einer Box (ausgeblendet)
+            items = [it for it in items if str(it.path) not in boxed]
             install_dirs = installed_locations() if any(i.kind == "folder" for i in items) else set()
             for it in items:
                 classify(it, rules, self.memory)
@@ -10484,7 +10756,7 @@ class MainWindow(_Base):
 
     def refresh(self):
         groups, left = self.plan()
-        boxes = {n: self.box_entries(d) for n, d in self.box_dirs().items()}
+        boxes = {n: self.box_items(n) for n in self.box_names()}
         names = list(groups) + [b for b in boxes if b not in groups]
         if self.selected not in names:
             self.selected = None
@@ -10670,7 +10942,7 @@ class MainWindow(_Base):
             hint = f": {one.category}" if one else ""
             m.addAction(f"✓  Vorschlag übernehmen{hint}", lambda: self.accept_suggestions(ids))
         sub = glass_menu(m, "Verschieben nach")
-        boxes = self.box_dirs()
+        boxes = set(self.box_names())
         for g in self.known_groups(groups):
             act = sub.addAction(("▣  " if g in boxes else "") + g, lambda g=g: self.assign(ids, g))
             act.setEnabled(not (one and one.category == g and one.confidence != "low"))
@@ -10707,7 +10979,27 @@ class MainWindow(_Base):
         m.exec(pos)
 
     def back_to_desktop(self, paths):
-        self.fences.to_desktop(paths)
+        if self.fences:
+            self.fences.to_desktop(paths)
+        else:
+            self.boxes.release(paths)
+        self.rescan()
+
+    def files_to_box(self, files: list, name: str):
+        """Aus dem Ordner-Assistenten in eine Desktop-Box: Datei kommt auf den Desktop
+        (Rückgängig über den Assistenten) und wird der Box zugeordnet."""
+        if not self.confirm("In Desktop-Box legen",
+                            f"{len(files)} Datei(en) auf den Desktop legen und der Box „{name}“ "
+                            f"zuordnen?"):
+            return
+        moves, failed, _journal = org_move_into(files, desktop_dirs()[0])
+        new = [Path(dst) for _src, dst in moves]
+        failed += (self.fences.move_to(new, name, quiet=True) if self.fences
+                   else self.boxes.assign(new, name))
+        if failed:
+            self.message("Desktop-Box", "Nicht alles einsortiert:\n\n" + "\n".join(failed[:15]),
+                         warn=True)
+        self.organizer.analyze()
         self.rescan()
 
     # ---------- Papierkorb ----------
@@ -10766,11 +11058,18 @@ class MainWindow(_Base):
                          f"Administratorrechte nötig.\n\n" + "\n".join(failed[:15]), warn=True)
         if len(failed) < len(paths):
             self.subtitle.setText(f"{len(paths) - len(failed)} Objekt(e) im Papierkorb")
+            if self.boxes.prune() and self.fences:
+                self.fences.sync()
             self.rescan()
 
     # ---------- Boxen ----------
     def new_box(self):
-        self.fences.new_box()
+        if self.fences:
+            self.fences.new_box()
+        else:
+            name = ask_box_name("Neue Box", "")
+            if name:
+                self.boxes.add_box(name)
         self.refresh()
 
     def toggle_boxes(self):
@@ -10971,18 +11270,17 @@ class MainWindow(_Base):
 
     def card_menu(self, name, pos):
         m = glass_menu(self)
-        box = self.box_dirs().get(name)
+        box = name in self.box_names()
         planned = [i for i, it in enumerate(self.items)
                    if it.category == name and it.confidence not in ("low", "keep")]
         fence = self.fences.fences.get(name) if self.fences else None
-        if box is not None:
-            m.addAction("↗  Box-Ordner öffnen", lambda: self.open_item(box))
+        if box:
             if fence:
                 m.addAction("✎  Box umbenennen …", lambda: self.rename_box(name))
         else:
             m.addAction("✎  Umbenennen …", lambda: self.rename_group(name))
         if planned:
-            m.addAction("⌂  Neue Objekte nicht einsortieren" if box is not None
+            m.addAction("⌂  Neue Objekte nicht einsortieren" if box
                         else "⌂  Auflösen (alles auf dem Desktop lassen)",
                         lambda: self.keep(planned))
         if fence:
@@ -11048,18 +11346,21 @@ class MainWindow(_Base):
                             f"einsortieren?\n\n{check}\n\nMit „Rückgängig“ jederzeit umkehrbar."):
             return
         self.memory.save()
-        try:
-            _, denied = apply(self.args.storage, groups)
-        except OSError as e:
-            return self.message("Fehler", str(e), warn=True)
+        before, denied = {}, []
+        for cat, its in groups.items():
+            paths = [it.path for it in its]
+            before.update({str(p): self.boxes.box_of(p) for p in paths})
+            denied += (self.fences.move_to(paths, cat, quiet=True) if self.fences
+                       else self.boxes.assign(paths, cat))
+        boxes_journal({p: b for p, b in before.items() if self.boxes.box_of(p) != b})
         if self.fences:
             self.fences.sync()
-        text = (f"{n - len(denied)} Objekte in Boxen einsortiert.\n\nDie Boxen liegen jetzt auf "
-                f"dem Desktop: Klick startet, Titelleiste ziehen verschiebt, Doppelklick "
-                f"auf den Titel klappt ein.")
+        text = (f"{n - len(denied)} Objekte in Boxen einsortiert.\n\nDie Symbole bleiben im "
+                f"Desktop-Ordner: Solange Desktop Sorter läuft, erscheinen sie nur in ihrer Box – "
+                f"beendest du die App, liegen sie wieder ganz normal auf dem Desktop.")
         if denied:
-            text += (f"\n\n{len(denied)} Verknüpfung(en) auf dem öffentlichen Desktop brauchen "
-                     f"Administratorrechte:\n" + ", ".join(denied) +
+            text += (f"\n\n{len(denied)} Objekt(e) auf dem öffentlichen Desktop brauchen "
+                     f"Administratorrechte:\n" + "\n".join(denied) +
                      "\n\nProgramm als Administrator starten oder „Öffentlicher Desktop“ ausschalten.")
         self.message("Fertig", text, warn=bool(denied))
         self.rescan()
@@ -11067,12 +11368,19 @@ class MainWindow(_Base):
     def undo(self):
         if not self.confirm("Rückgängig", "Letzte Sortierung vollständig rückgängig machen?"):
             return
+        js = sorted(JOURNAL_DIR.glob("journal-*[0-9].json"), key=lambda j: j.stat().st_mtime) \
+            if JOURNAL_DIR.is_dir() else []
         out = io.StringIO()
         try:
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-                undo("")
+            if js and "assign" in json.loads(js[-1].read_text(encoding="utf-8")):
+                print(f"Rückgängig gemacht: {boxes_undo(js[-1], self.boxes)} Objekte.", file=out)
+            else:                                    # Protokoll einer früheren Version
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                    undo("")
         except SystemExit as e:
             return self.message("Rückgängig", str(e), warn=True)
+        except (OSError, ValueError) as e:
+            return self.message("Rückgängig", f"Protokoll nicht lesbar: {e}", warn=True)
         if self.fences:
             self.fences.mark_desktop_known()    # Zurückgelegtes nicht wieder einsortieren
             self.fences.sync()
@@ -11190,6 +11498,17 @@ class Win32:
         if not cls.ok:
             return bool(QApplication.mouseButtons() & Qt.LeftButton)
         return bool(cls._u().GetAsyncKeyState(0x01) & 0x8000)
+
+    @classmethod
+    def cursor_on_desktop(cls) -> bool:
+        """Liegt der Mauszeiger über der Desktop-Symbolfläche (nicht über einer Box)?"""
+        if not cls.ok:
+            return False
+        import ctypes
+        from ctypes import wintypes
+        pt = wintypes.POINT()
+        cls._u().GetCursorPos(ctypes.byref(pt))
+        return bool(cls.desktop_listview_at(pt.x, pt.y))
 
     @classmethod
     def desktop_listview_at(cls, x: int, y: int) -> int:
@@ -11345,33 +11664,77 @@ def inspect_paths(paths: list[Path]) -> list[Item]:
     return items
 
 
-# ---------- Autostart (Verknüpfung im Autostart-Ordner) ----------
+# ---------- Autostart (Registry „Run“ des Benutzers, ohne Adminrechte) ----------
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_APPROVED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+
+
 def startup_lnk() -> Path:
+    """Frühere Versionen: Verknüpfung im Autostart-Ordner (wird ersetzt)."""
     return (Path(os.environ.get("APPDATA", Path.home())) / "Microsoft" / "Windows" /
             "Start Menu" / "Programs" / "Startup" / "Desktop Sorter.lnk")
 
 
+def autostart_command() -> str:
+    return app_command("--background")
+
+
+def autostart_status() -> str:
+    """"ok" | "off" (kein Eintrag) | "stale" (zeigt auf andere Datei/Python) |
+    "disabled" (im Task-Manager unter Autostart deaktiviert)."""
+    if os.name != "nt":
+        return "off"
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+            value = winreg.QueryValueEx(k, AUTOSTART_NAME)[0]
+    except OSError:
+        return "off"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _APPROVED_KEY) as k:
+            flag = winreg.QueryValueEx(k, AUTOSTART_NAME)[0]
+        if isinstance(flag, bytes) and flag[:1] not in (b"\x02", b"\x06"):
+            return "disabled"
+    except OSError:
+        pass
+    return "ok" if value == autostart_command() else "stale"
+
+
 def autostart_enabled() -> bool:
-    return os.name == "nt" and startup_lnk().exists()
+    return autostart_status() == "ok"
 
 
-def set_autostart(on: bool) -> None:
-    lnk = startup_lnk()
-    if not on:
+def set_autostart(on: bool) -> bool:
+    """Eintrag setzen/entfernen. Beim Einschalten wird ein im Task-Manager deaktivierter
+    Eintrag wieder aktiviert – „Mit Windows starten“ in der App ist maßgeblich."""
+    if os.name != "nt":
+        return False
+    import winreg
+    try:
+        lnk = startup_lnk()                      # alte Verknüpfung: sonst Doppelstart
         if lnk.exists():
             lnk.unlink()
-        return
-    exe = Path(sys.executable)
-    if exe.with_name("pythonw.exe").exists():       # ohne Konsolenfenster starten
-        exe = exe.with_name("pythonw.exe")
-    script = Path(__file__).resolve()
-    q = lambda s: str(s).replace("'", "''")         # PowerShell-Quoting
-    ps = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{q(lnk)}');"
-          f"$s.TargetPath='{q(exe)}';"
-          f"$s.Arguments='\"{q(script)}\" --background';"
-          f"$s.WorkingDirectory='{q(script.parent)}';$s.Save()")
-    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                   capture_output=True, timeout=30, creationflags=NO_WINDOW)
+    except OSError:
+        pass
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+            if on:
+                winreg.SetValueEx(k, AUTOSTART_NAME, 0, winreg.REG_SZ, autostart_command())
+            else:
+                try:
+                    winreg.DeleteValue(k, AUTOSTART_NAME)
+                except FileNotFoundError:
+                    pass
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _APPROVED_KEY) as k:
+            try:
+                winreg.DeleteValue(k, AUTOSTART_NAME)   # Task-Manager-Sperre aufheben
+            except FileNotFoundError:
+                pass
+            if on:
+                winreg.SetValueEx(k, AUTOSTART_NAME, 0, winreg.REG_BINARY, b"\x02" + b"\0" * 11)
+    except OSError:
+        return False
+    return autostart_status() == "ok" if on else True
 
 
 def sync_context_menu(on: bool) -> None:
@@ -11588,13 +11951,18 @@ def checked_menu(parent: QMenu, title: str, options, current, on_pick) -> QMenu:
 
 
 # ---------- Box ----------
+FENCE_MIME = "application/x-desktop-sorter-path"
+
+
 class FenceList(QListWidget):
-    """Symbolraster einer Box. Klick startet, Ziehen verschiebt die Datei
-    (in eine andere Box oder – via Explorer – auf den Desktop)."""
+    """Symbolraster einer Box. Klick startet; Ziehen in eine andere Box ordnet um, Ziehen
+    auf den Desktop legt das Symbol wieder sichtbar dorthin zurück."""
     launched = Signal(str)
     filesDropped = Signal(list)
     menuRequested = Signal(str, QPoint)
     draggedOut = Signal(str)
+    toDesktop = Signal(str)
+    desktop_backed = True               # Objekte liegen im Desktop-Ordner (keine Ordner-Box)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -11651,17 +12019,28 @@ class FenceList(QListWidget):
             return
         path = it.data(Qt.UserRole)
         md = QMimeData()
-        md.setUrls([QUrl.fromLocalFile(path)])
+        md.setData(FENCE_MIME, path.encode("utf-8"))
+        if not self.desktop_backed:          # Ordner-Box: echte Datei an Explorer übergeben
+            md.setUrls([QUrl.fromLocalFile(path)])
         drag = QDrag(self)
         drag.setMimeData(md)
         drag.setPixmap(it.icon().pixmap(48, 48))
         drag.setHotSpot(QPoint(24, 24))
-        drag.exec(Qt.MoveAction | Qt.CopyAction, Qt.MoveAction)
-        if not Path(path).exists():          # vom Explorer/Desktop übernommen
+        result = drag.exec(Qt.MoveAction | Qt.CopyAction, Qt.MoveAction)
+        if not os.path.lexists(path):        # vom Explorer woandershin verschoben
             self.draggedOut.emit(path)
+        elif result == Qt.IgnoreAction and Win32.cursor_on_desktop():
+            self.toDesktop.emit(path)        # auf freie Desktopfläche gezogen
+
+    @staticmethod
+    def dropped_paths(md: QMimeData) -> list[str]:
+        if md.hasFormat(FENCE_MIME):
+            return [bytes(md.data(FENCE_MIME)).decode("utf-8")]
+        return [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
 
     def dragEnterEvent(self, e):
-        if e.mimeData().hasUrls() and e.source() is not self:
+        md = e.mimeData()
+        if (md.hasUrls() or md.hasFormat(FENCE_MIME)) and e.source() is not self:
             e.setDropAction(Qt.CopyAction)   # wir verschieben selbst; Quelle löscht nichts
             e.accept()
         else:
@@ -11670,7 +12049,7 @@ class FenceList(QListWidget):
     dragMoveEvent = dragEnterEvent
 
     def dropEvent(self, e):
-        paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        paths = self.dropped_paths(e.mimeData())
         e.setDropAction(Qt.CopyAction)
         e.accept()
         if paths:
@@ -11746,7 +12125,9 @@ class Fence(QWidget):
         self.list.launched.connect(mgr.launch)
         self.list.filesDropped.connect(lambda ps: mgr.move_to(ps, self.name))
         self.list.menuRequested.connect(lambda p, pos: mgr.item_menu(self, p, pos))
-        self.list.draggedOut.connect(mgr.note_returned)
+        self.list.draggedOut.connect(mgr.dragged_out)
+        self.list.toDesktop.connect(lambda p: mgr.to_desktop([p]))
+        self.list.desktop_backed = not portal
         lay.addWidget(self.list)
         self.grip = ResizeGrip(self)
         self.grip.raise_()
@@ -11977,7 +12358,7 @@ class Fence(QWidget):
 
     # ----- Drop auf Titelleiste/Rand -----
     def dragEnterEvent(self, e):
-        if e.mimeData().hasUrls():
+        if e.mimeData().hasUrls() or e.mimeData().hasFormat(FENCE_MIME):
             e.setDropAction(Qt.CopyAction)
             e.accept()
             self.enterEvent(e)                  # eingeklappte Box beim Ziehen öffnen
@@ -11986,7 +12367,7 @@ class Fence(QWidget):
         self.leaveEvent(e)
 
     def dropEvent(self, e):
-        paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        paths = FenceList.dropped_paths(e.mimeData())
         e.setDropAction(Qt.CopyAction)
         e.accept()
         if paths:
@@ -11995,8 +12376,9 @@ class Fence(QWidget):
 
 # ---------- Verwaltung aller Boxen ----------
 class FenceManager(QObject):
-    """Eine Box pro Unterordner von STORAGE_DIR plus Ordner-Portale; folgt Änderungen
-    live, sortiert neue Desktop-Verknüpfungen ein und reagiert auf Quick-Hide."""
+    """Glas-Boxen auf dem Desktop. Die Objekte bleiben im Desktop-Ordner; solange die App
+    läuft, sind sie dort ausgeblendet und erscheinen in ihrer Box (BoxStore). Dazu
+    Ordner-Boxen (Portale), automatisches Einsortieren und Quick-Hide."""
     openManager = Signal()
     visibilityChanged = Signal(bool)
     notify = Signal(str, str)
@@ -12011,6 +12393,13 @@ class FenceManager(QObject):
         self.rules_path, self.memory_path = rules_path, memory_path
         self.cfg_path = storage / ".boxen.json"
         self.cfg = self._load_cfg()
+        self.store = BoxStore(self.cfg, self.write_cfg)
+        # Frühere Versionen: Box-Inhalte lagen in storage/<Box> → zurück auf den Desktop
+        self.migration_failed = migrate_box_folders(storage, self.store, desktop_dirs()[0])
+        self.store.prune()
+        self.hide_failed = self.store.hide_all()
+        self._rehide = QTimer(self, singleShot=True, interval=60_000)
+        self._rehide.timeout.connect(self.store.hide_all)   # Abmelden wurde abgebrochen
         self.fences: dict[str, Fence] = {}
         self.icons = icon_cache()
         self.visible = True
@@ -12092,15 +12481,9 @@ class FenceManager(QObject):
                 f._end_peek()
 
     # ----- Abgleich mit dem Dateisystem -----
-    def group_dirs(self) -> dict[str, Path]:
-        """Box-Ordner (ohne Portale) — Ziele fürs Einsortieren."""
-        if not self.storage.is_dir():
-            return {}
-        return {d.name: d for d in sorted(self.storage.iterdir())
-                if d.is_dir() and not d.name.startswith(".")}
-
-    def sources(self) -> dict[str, tuple[Path, bool]]:
-        src = {n: (d, False) for n, d in self.group_dirs().items()}
+    def sources(self) -> dict[str, tuple[Path | None, bool]]:
+        """Name → (Ordner bei Ordner-Boxen sonst None, ist Ordner-Box)."""
+        src = {n: (None, False) for n in self.store.names()}
         for name, box in self.cfg["boxes"].items():
             portal = box.get("portal")
             if portal and Path(portal).is_dir() and name not in src:
@@ -12108,7 +12491,19 @@ class FenceManager(QObject):
         return src
 
     def names(self) -> list[str]:
-        return list(self.group_dirs())
+        """Boxen (ohne Ordner-Boxen) – Ziele fürs Einsortieren."""
+        return self.store.names()
+
+    def shutdown(self):
+        """Beim Beenden/Abmelden: alle Symbole wieder sichtbar auf den Desktop."""
+        self._rehide.stop()
+        self.store.show_all()
+
+    def session_ending(self):
+        """Windows meldet Abmelden/Herunterfahren: einblenden. Wird das abgebrochen und die
+        App läuft weiter, blendet sie nach einer Minute wieder aus."""
+        self.store.show_all()
+        self._rehide.start()
 
     def sync(self):
         src = self.sources()
@@ -12123,13 +12518,19 @@ class FenceManager(QObject):
                 self._place(fence)
                 if self.visible:
                     fence.show()
-            entries = [p for p in folder.iterdir()
-                       if p.name.lower() != "desktop.ini" and not p.name.startswith(".")
-                       and not (portal and is_hidden(p))]
-            fence.set_items(entries[:PORTAL_LIMIT] if portal else entries)
+            if portal:
+                try:
+                    entries = [p for p in folder.iterdir()
+                               if p.name.lower() != "desktop.ini" and not p.name.startswith(".")
+                               and not is_hidden(p)][:PORTAL_LIMIT]
+                except OSError:
+                    entries = []
+            else:
+                entries = self.store.items(name)
+            fence.set_items(entries)
         if self.watcher.directories():
             self.watcher.removePaths(self.watcher.directories())
-        self.watcher.addPaths([str(self.storage)] + [str(f) for f, _ in src.values()])
+        self.watcher.addPaths([str(self.storage)] + [str(f) for f, p in src.values() if p])
 
     def _place(self, fence: Fence):
         box = fence.st
@@ -12262,7 +12663,15 @@ class FenceManager(QObject):
     def note_returned(self, path: str):
         self.returned.add(Path(path).name)
 
+    def dragged_out(self, path: str):
+        """Per Explorer aus der Box woandershin verschoben → Zuordnung vergessen."""
+        self.note_returned(path)
+        self.store.prune()
+        self._sync.start()
+
     def _autosort(self):
+        if self.store.prune():                  # Objekt gelöscht/umbenannt → Box aktualisieren
+            self._sync.start()
         current = self._desktop_names()
         new = [p for n, p in current.items()
                if n not in self.desk_known and n not in self.returned]
@@ -12270,7 +12679,7 @@ class FenceManager(QObject):
         if not self.settings["autosort"] or (self._worker and self._worker.isRunning()):
             return
         cands = [p for p in new if p.suffix.lower() in (".lnk", ".url") and not is_hidden(p)]
-        targets = set(self.group_dirs())
+        targets = set(self.names())
         if not cands or not targets:
             return
         rules = load_rules(self.rules_path)
@@ -12328,25 +12737,55 @@ class FenceManager(QObject):
         self._sync.start()
         return failed
 
-    def folder_of(self, name: str) -> Path:
-        src = self.sources().get(name)
-        return src[0] if src else self.storage / name
+    def on_desktop(self, path) -> bool:
+        parent = os.path.normcase(str(Path(path).parent))
+        return any(os.path.normcase(str(d)) == parent for d in (self.desktops or desktop_dirs()))
 
-    def move_to(self, paths, name: str, quiet=False):
-        folder = self.folder_of(name)
-        folder.mkdir(parents=True, exist_ok=True)
-        self._move(paths, folder, quiet)
+    def move_to(self, paths, name: str, quiet=False) -> list[str]:
+        """In eine Box legen. Normale Box: Objekt bleibt auf dem Desktop (liegt es woanders,
+        kommt es erst auf den Desktop) und wird dort ausgeblendet. Ordner-Box: echte Datei
+        wird in deren Ordner verschoben."""
+        src = self.sources().get(name)
+        if src and src[1]:
+            return self._move(paths, src[0], quiet)
+        desk = (self.desktops or [desktop_dirs()[0]])[0]
+        local, failed = [], []
+        for p in map(Path, paths):
+            if not os.path.lexists(p):
+                continue
+            if not self.on_desktop(p):
+                target = unique_dest(desk, p.name)
+                try:
+                    shutil.move(str(p), str(target))
+                except OSError as e:
+                    failed.append(f"{p.name}: {e.strerror or e}")
+                    continue
+                self.desk_known.add(target.name)         # nicht nochmal automatisch sortieren
+                p = target
+            local.append(p)
+        failed += [f"{n}: öffentlicher Desktop – nur mit Administratorrechten"
+                   for n in self.store.assign(local, name)]
+        if failed and not quiet:
+            QMessageBox.warning(None, "Desktop Sorter", "Nicht einsortiert:\n\n" + "\n".join(failed))
+        self._sync.start()
+        return failed
 
     def to_desktop(self, paths):
+        """Aus der Box zurück: sichtbar auf den Desktop (Ordner-Box: Datei verschieben)."""
         for p in paths:
             self.note_returned(p)
-        self._move(paths, desktop_dirs()[0])
+        boxed = [p for p in paths if self.store.box_of(p)]
+        self.store.release(boxed)
+        rest = [p for p in paths if p not in boxed and not self.on_desktop(p)]
+        if rest:
+            self._move(rest, desktop_dirs()[0])
+        self._sync.start()
 
     # ----- Boxen anlegen / ändern -----
     def new_box(self, paths=()):
         name = ask_box_name("Neue Box", "")
         if name and name not in self.sources():
-            (self.storage / name).mkdir(exist_ok=True)
+            self.store.add_box(name)
             if paths:
                 self.move_to(paths, name)
             self._sync.start()
@@ -12370,13 +12809,6 @@ class FenceManager(QObject):
         new = ask_box_name("Box umbenennen", old)
         if not new or new == old or new in self.sources():
             return
-        if not fence.portal:
-            try:
-                (self.storage / old).rename(self.storage / new)
-            except OSError as e:
-                QMessageBox.warning(None, "Desktop Sorter", f"Umbenennen nicht möglich:\n{e}")
-                return
-            fence.folder = self.storage / new
         self.cfg["boxes"][new] = self.cfg["boxes"].pop(old, {})
         self.fences[new] = self.fences.pop(old)
         fence.name = new
@@ -12405,14 +12837,10 @@ class FenceManager(QObject):
                 self.sync()
             return
         if QMessageBox.question(None, "Box auflösen",
-                                f"Alle {fence.count} Objekte aus „{fence.name}“ zurück auf den "
-                                f"Desktop legen und die Box entfernen?") != QMessageBox.Yes:
+                                f"Alle {fence.count} Objekte aus „{fence.name}“ wieder normal "
+                                f"auf den Desktop legen und die Box entfernen?") != QMessageBox.Yes:
             return
-        folder = self.storage / fence.name
-        if not self._move([str(p) for p in folder.iterdir()], desktop_dirs()[0]):
-            shutil.rmtree(folder, ignore_errors=True)
-            self.cfg["boxes"].pop(fence.name, None)
-            self.write_cfg()
+        self.store.remove_box(fence.name)
         self.mark_desktop_known()
         self._sync.start()
 
@@ -12482,9 +12910,9 @@ class FenceManager(QObject):
                      lambda v: self.set_box_option(fence, "sort", v))
         m.addMenu(look)
         m.addAction("✎  Umbenennen …", lambda: self.rename(fence))
-        m.addAction("↗  Ordner im Explorer öffnen",
-                    lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(fence.folder))))
         if fence.portal:
+            m.addAction("↗  Ordner im Explorer öffnen",
+                        lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(fence.folder))))
             m.addAction("🧹  Ordner aufräumen …", lambda: self.open_cleaner(fence.folder))
         m.addSeparator()
         m.addAction("+  Neue Box …", lambda: self.new_box())
@@ -14127,7 +14555,7 @@ ORG_QUICK_FOLDERS = [("🖥", "Desktop", "desktop"), ("📄", "Dokumente", "docu
 def org_move_into(files: list, dest: Path) -> tuple:
     """Dateien in einen anderen Ordner legen (nie überschreiben). Protokoll im Format von
     org_undo, damit „Letzte Sortierung rückgängig“ auch das zurücknimmt.
-    → (Anzahl, Fehlermeldungen, Protokoll oder None bei verschiedenen Laufwerken)."""
+    → ([[alt, neu], …], Fehlermeldungen, Protokoll oder None bei verschiedenen Laufwerken)."""
     dest = Path(dest)
     moves, failed = [], []
     try:
@@ -14136,7 +14564,7 @@ def org_move_into(files: list, dest: Path) -> tuple:
     except ValueError:                                   # anderes Laufwerk
         root = None
     except OSError as e:
-        return 0, [f"{dest}: {e.strerror or e}"], None
+        return [], [f"{dest}: {e.strerror or e}"], None
     journal = None
     if root is not None:
         JOURNAL_DIR.mkdir(exist_ok=True)
@@ -14162,7 +14590,7 @@ def org_move_into(files: list, dest: Path) -> tuple:
         if journal:
             journal.write_text(json.dumps({"root": str(root), "created": [], "moves": moves},
                                           ensure_ascii=False, indent=1), encoding="utf-8")
-    return len(moves), failed, journal
+    return moves, failed, journal
 
 
 def org_research_dest(f, category: str) -> str:
@@ -14185,7 +14613,8 @@ class OrganizerView(QWidget):
         super().__init__(parent)
         self.mgr, self.folder = mgr, Path(folder)
         self.plan = None
-        self.boxes_fn = boxes_fn                       # → {Name: Ordner} der Desktop-Boxen
+        self.boxes_fn = boxes_fn                       # → Namen der Desktop-Boxen
+        self.box_move = None                           # fn(Dateien, Box) im Hauptfenster
         self.on_swipe = None                           # fn(Dateien, Titel, Plan) im Hauptfenster
         self.research: dict[str, dict] = {}           # Pfad → Ergebnis der Recherche
         self._research: ResearchJob | None = None
@@ -14766,8 +15195,8 @@ class OrganizerView(QWidget):
                                    "und kann nicht automatisch rückgängig gemacht werden.")) \
                 != QMessageBox.Yes:
             return
-        moved, failed, _journal = org_move_into(files, dest)
-        msg = f"{moved} Datei(en) verschoben nach {dest}."
+        moves, failed, _journal = org_move_into(files, dest)
+        msg = f"{len(moves)} Datei(en) verschoben nach {dest}."
         if failed:
             msg += "\n\nNicht verschoben:\n" + "\n".join(failed[:15])
         QMessageBox.information(self, "Verschieben", msg)
@@ -14948,11 +15377,11 @@ class OrganizerView(QWidget):
             target = org_known_folder(key)
             if os.path.normcase(str(target)) != os.path.normcase(str(self.folder)):
                 mm.addAction(f"{glyph}  {label}", lambda t=target: self.move_files(files, t))
-        boxes = self.boxes_fn() if self.boxes_fn else {}
-        if boxes:
+        boxes = self.boxes_fn() if self.boxes_fn else []
+        if boxes and self.box_move:
             bm = glass_menu(mm, "▣  Desktop-Box")
-            for name, folder in boxes.items():
-                bm.addAction(name, lambda d=folder: self.move_files(files, d))
+            for name in boxes:
+                bm.addAction(name, lambda n=name: self.box_move(files, n))
             mm.addMenu(bm)
         mm.addSeparator()
         mm.addAction("Anderer Ordner …", lambda: self._move_pick(files))
@@ -15108,11 +15537,13 @@ def main():
     ap.add_argument("--memory", type=Path, default=DEFAULT_MEMORY)
     ap.add_argument("--min-group", type=int, default=2)
     ap.add_argument("--storage", type=Path, default=STORAGE_DIR,
-                    help="Ordner mit dem Inhalt der Glas-Boxen")
+                    help="Ordner mit den Einstellungen der Glas-Boxen")
     ap.add_argument("--background", action="store_true",
                     help="nur Boxen + Infobereich-Symbol (für den Autostart)")
     ap.add_argument("--organize", nargs="?", default=None, metavar="ORDNER",
                     help="Ordner-Assistent für diesen Ordner öffnen (Explorer-Rechtsklick)")
+    ap.add_argument("--restore", action="store_true",
+                    help="alle Box-Symbole wieder sichtbar auf den Desktop (Notfall nach Absturz)")
     ap.add_argument("--screenshot", type=Path, help=argparse.SUPPRESS)
     # parse_known_args: Explorer übergibt Pfade mit Eigenheiten (z. B. „C:\"“)
     args, _unknown = ap.parse_known_args()
@@ -15140,6 +15571,8 @@ def main():
     app.setFont(font)
     app.setStyleSheet(STYLE)
 
+    if args.restore:                # RunOnce nach einem Absturz bzw. von Hand
+        sys.exit(restore_desktop(args.storage))
     if args.screenshot:             # Testhilfe: nur Hauptfenster rendern
         win = MainWindow(args)
         win.show()
@@ -15156,10 +15589,37 @@ def main():
     sys.exit(app.exec())
 
 
+def instance_name() -> str:
+    return "DesktopSorter-" + os.environ.get("USERNAME", os.environ.get("USER", "u"))
+
+
+def restore_desktop(storage: Path) -> int:
+    """Alle von Desktop Sorter ausgeblendeten Symbole wieder einblenden – außer die App
+    läuft gerade (dann verwaltet sie das selbst)."""
+    sock = QLocalSocket()
+    sock.connectToServer(instance_name())
+    if sock.waitForConnected(300):
+        return 0
+    cfg_path = Path(storage) / ".boxen.json"
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+
+    def save():
+        try:
+            cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+
+    BoxStore(cfg, save).show_all()
+    return 0
+
+
 def run_app(app: QApplication, args) -> None:
     """Dauerbetrieb: Boxen auf dem Desktop, Infobereich-Symbol, Hauptfenster bei Bedarf."""
     # Nur eine Instanz: ein zweiter Start öffnet bloß das Hauptfenster der ersten.
-    server_name = "DesktopSorter-" + os.environ.get("USERNAME", os.environ.get("USER", "u"))
+    server_name = instance_name()
     sock = QLocalSocket()
     sock.connectToServer(server_name)
     if sock.waitForConnected(300):
@@ -15179,13 +15639,18 @@ def run_app(app: QApplication, args) -> None:
     fences = FenceManager(args.storage, args.rules, args.memory)
     fences.sync()
     app.aboutToQuit.connect(fences.hook.stop)
+    # App beendet (auch über das Infobereich-Menü) oder Windows meldet sich ab / fährt
+    # herunter → alle Symbole wieder ganz normal auf den Desktop
+    app.aboutToQuit.connect(fences.shutdown)
+    app.commitDataRequest.connect(lambda _sm: fences.session_ending())
     # Offene Aufräum-Entscheidungen beim Beenden noch ausführen
     app.aboutToQuit.connect(lambda: state["win"] and state["win"].cleaner.commit_and_report())
     # Autostart: Verknüpfung bei jedem Start (neu) anlegen – zeigt so auch nach
     # dem Verschieben der .pyw oder einer neuen Python-Umgebung auf die richtige Stelle.
-    if Win32.ok and fences.settings["autostart"]:
-        import threading
-        threading.Thread(target=set_autostart, args=(True,), daemon=True).start()
+    if Win32.ok and fences.settings["autostart"] and not set_autostart(True):
+        QTimer.singleShot(3000, lambda: fences.notify.emit(
+            "Autostart nicht eingetragen", "Desktop Sorter konnte sich nicht in den "
+            "Windows-Autostart eintragen (Registry gesperrt?)."))
     if fences.settings["context_menu"]:
         sync_context_menu(True)             # Rechtsklick-Eintrag aktuell halten
     # Erinnerung an volle Downloads: 10 min nach dem Start, danach alle 6 h prüfen
@@ -15238,6 +15703,11 @@ def run_app(app: QApplication, args) -> None:
         tray.messageClicked.connect(fences.message_clicked)
         tray.show()
         app._tray = tray                # Referenz halten
+    problems = fences.migration_failed + [f"{n}: nicht ausblendbar (Rechte)" for n in fences.hide_failed]
+    if problems:
+        QTimer.singleShot(2500, lambda: fences.notify.emit(
+            "Desktop Sorter", "Nicht alles konnte in die Boxen übernommen werden:\n"
+            + "\n".join(problems[:5])))
 
     if args.organize_folder:
         fences.open_organizer(args.organize_folder)
